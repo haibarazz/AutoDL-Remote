@@ -28,7 +28,7 @@
 
 > **一句话理解：** AutoDL Remote 不是同步框架，而是给 Codex 用的一组 SSH 原语。
 
-## ✨ 核心特性
+## ✨ What You Get
 
 | 能力 | 说明 |
 | --- | --- |
@@ -40,53 +40,43 @@
 | 📜 日志查看 | 用 `tail` 查看远端训练日志，不必下载大文件 |
 | 🧩 Codex 友好 | 插件不替你判断同步策略，把决策权留给用户和 Codex |
 
-## 🧠 工作原理
+## ✅ Requirements
 
-<div align="center">
-  <img src="./docs/images/autodl-remote-workflow.png" alt="AutoDL Remote 典型工作流" width="100%">
-</div>
+- Codex App，或支持插件 marketplace 的 Codex CLI。
+- 本机需要 `bash`、`ssh`、`scp`。
+- 可选安装 `rsync`，目录同步会更快；没有 `rsync` 时仍可使用 `scp`。
+- 远端机器只需要能 SSH 登录，不需要安装 Codex、Python 包、OpenAI key 或额外 daemon。
+- 如果使用密码登录，macOS 上可以选择把密码保存到 Keychain，方便 Codex 非交互运行命令。
 
-&emsp;&emsp;典型流程是：先查看远端项目结构，再把需要编辑的脚本拉到本地；Codex 在本地修改后，显式上传对应文件；训练或推理在远端执行；最后只查看日志或拉回必要结果。
+## 📦 Install
 
-<div align="center">
-  <img src="./docs/images/autodl-remote-boundary.png" alt="AutoDL Remote 本地远端边界" width="100%">
-</div>
+### Option A: Codex App 安装
 
-&emsp;&emsp;这个边界很重要：**本地负责代码和修改痕迹，远端负责大模型、数据集、checkpoint 和 GPU 任务。** 插件不会默认下载模型权重，也不会默认把整个远端目录同步回来。
+1. 打开 Codex App。
+2. 进入 `插件` 页面。
+3. 点击右上角 `管理` 或插件来源下拉框。
+4. 选择 `+ 添加更多`。
+5. 添加这个 GitHub 仓库，或添加你本地 clone 后的仓库根目录。
 
-## 📚 目录导航
-
-| 文档 | 内容 |
-| --- | --- |
-| [插件目录](./plugins/autodl-remote) | Codex App 插件源码 |
-| [插件说明](./plugins/autodl-remote/README.md) | CLI 命令和插件内部说明 |
-| [设计说明](./docs/design.md) | 为什么做成极简 SSH 工具层 |
-| [故障排查](./docs/troubleshooting.md) | 安装、SSH、路径、权限等问题 |
-| [更新记录](./CHANGELOG.md) | 版本变化 |
-
-## 🚀 快速开始
-
-### 1. 在 Codex App 里安装
-
-1. Clone 这个仓库。
-2. 打开 Codex App。
-3. 进入 `插件` 页面。
-4. 打开插件来源下拉框，选择 `+ 添加更多`。
-5. 选择这个仓库的根目录。
-
-应该选择：
+仓库地址：
 
 ```text
-/path/to/autodl-remote
+https://github.com/haibarazz/AutoDL-Remote
 ```
 
-不要选择：
+如果选择本地目录，应该选择仓库根目录：
 
 ```text
-/path/to/autodl-remote/plugins/autodl-remote
+/path/to/AutoDL-Remote
 ```
 
-Codex App 会在仓库根目录下读取：
+不要选择插件子目录：
+
+```text
+/path/to/AutoDL-Remote/plugins/autodl-remote
+```
+
+Codex App 会在仓库根目录读取：
 
 ```text
 .agents/plugins/marketplace.json
@@ -94,9 +84,23 @@ Codex App 会在仓库根目录下读取：
 
 添加 marketplace 后，在插件列表里选择 `AutoDL Remote` 并安装/启用。
 
-### 2. 安装 CLI
+### Option B: Codex CLI marketplace
+
+如果你的 Codex CLI 支持插件命令，可以使用 GitHub shorthand：
 
 ```bash
+codex plugin marketplace add haibarazz/AutoDL-Remote
+```
+
+然后在 Codex App 的插件页面安装，或用你的 Codex 插件管理入口安装 `AutoDL Remote`。
+
+### Install CLI command
+
+AutoDL Remote 的实际 SSH 操作由本地 `autodl-remote` CLI 完成。clone 仓库后运行：
+
+```bash
+git clone https://github.com/haibarazz/AutoDL-Remote.git
+cd AutoDL-Remote
 ./scripts/install-cli.sh
 ```
 
@@ -112,7 +116,15 @@ Codex App 会在仓库根目录下读取：
 ./scripts/install-cli.sh ~/.local/bin
 ```
 
-### 3. 添加远端账号
+验证 CLI 是否可用：
+
+```bash
+autodl-remote --help
+```
+
+## 🚀 Quick Start
+
+### 1. 添加远端账号
 
 密码登录：
 
@@ -142,7 +154,7 @@ autodl-remote account use autodl-gpu
 autodl-remote account test autodl-gpu
 ```
 
-### 4. 绑定当前项目
+### 2. 绑定当前项目
 
 ```bash
 cd /path/to/local/project
@@ -159,7 +171,52 @@ REMOTE_ROOT="/root/autodl-tmp/my-project"
 
 密码不会写入项目配置。
 
-## 🛠️ 常用命令
+### 3. 让 Codex 使用插件
+
+在 Codex 对话里可以这样说：
+
+```text
+使用 AutoDL Remote，帮我检查当前项目是否已经绑定远端，并运行 doctor。
+```
+
+```text
+使用 AutoDL Remote 查看远端目录结构，不要下载模型、数据集或 checkpoint。
+```
+
+```text
+我已经在本地改好了 train.py。使用 AutoDL Remote 上传这个文件到远端，然后在远端运行训练并 tail 日志。
+```
+
+安装成功后，Codex 应该能使用插件技能 `autodl-remote:autodl-remote`，并通过 `autodl-remote` CLI 执行 SSH、上传、下载和远端命令。
+
+## 🧪 First Run
+
+第一次建议只做无破坏检查：
+
+```bash
+autodl-remote doctor
+autodl-remote tree . --depth 2
+autodl-remote exec -- pwd
+autodl-remote exec -- nvidia-smi
+```
+
+如果这几步正常，再开始上传代码或运行训练。
+
+## 🧠 工作原理
+
+<div align="center">
+  <img src="./docs/images/autodl-remote-workflow.png" alt="AutoDL Remote 典型工作流" width="100%">
+</div>
+
+&emsp;&emsp;典型流程是：先查看远端项目结构，再把需要编辑的脚本拉到本地；Codex 在本地修改后，显式上传对应文件；训练或推理在远端执行；最后只查看日志或拉回必要结果。
+
+<div align="center">
+  <img src="./docs/images/autodl-remote-boundary.png" alt="AutoDL Remote 本地远端边界" width="100%">
+</div>
+
+&emsp;&emsp;这个边界很重要：**本地负责代码和修改痕迹，远端负责大模型、数据集、checkpoint 和 GPU 任务。** 插件不会默认下载模型权重，也不会默认把整个远端目录同步回来。
+
+## 🛠️ Commands
 
 | 命令 | 用途 |
 | --- | --- |
@@ -175,7 +232,7 @@ REMOTE_ROOT="/root/autodl-tmp/my-project"
 | `autodl-remote exec --detach --name train -- python train.py` | 远端后台运行长任务 |
 | `autodl-remote tail -- .autodl-remote/logs/train.log` | 查看远端日志 |
 
-## 🧪 典型场景
+## 📌 Usage Patterns
 
 ### 远端已有项目
 
@@ -207,7 +264,7 @@ autodl-remote cat -- outputs/metrics.json
 autodl-remote get outputs/metrics.json outputs/metrics.json
 ```
 
-## ✅ 它不做什么
+## ✅ What This Plugin Does Not Do
 
 AutoDL Remote 保持克制，不做这些事：
 
@@ -220,7 +277,7 @@ AutoDL Remote 保持克制，不做这些事：
 
 这些决策交给用户和 Codex，因为不同项目的代码组织方式差异很大。
 
-## 🔐 安全与隐私
+## 🔐 Security Notes
 
 - 账号配置保存在 `~/.autodl-remote/accounts/`。
 - 项目只保存账号名和远端目录。
@@ -234,7 +291,55 @@ autodl-remote account password-delete autodl-gpu
 
 网络流量只会发往你配置的 SSH 主机。远端命令和文件传输都由本地 CLI 显式触发。
 
-## 📦 仓库结构
+## 🔄 Update and Uninstall
+
+更新本地 checkout：
+
+```bash
+cd /path/to/AutoDL-Remote
+git pull
+./scripts/install-cli.sh
+```
+
+如果你通过 Codex App 安装插件，可以在插件页面使用升级或重新安装入口。
+
+卸载 CLI 软链接：
+
+```bash
+rm -f /opt/homebrew/bin/autodl-remote
+```
+
+账号配置默认保留在：
+
+```text
+~/.autodl-remote/accounts/
+```
+
+如果确认不再使用，可以手动删除。
+
+## 🧯 Troubleshooting
+
+| 问题 | 处理方式 |
+| --- | --- |
+| 插件列表里找不到 `AutoDL Remote` | 确认添加的是仓库根目录或 GitHub 仓库，而不是 `plugins/autodl-remote` 子目录 |
+| Codex 说找不到 `autodl-remote` | 运行 `./scripts/install-cli.sh`，并确认安装目录在 `PATH` 里 |
+| SSH 密码交互卡住 | 使用 `account password-save` 保存到 macOS Keychain，或改用 SSH key |
+| 远端目录不对 | 重新执行 `autodl-remote bind --account <name> --remote <path>` |
+| 不想下载大文件 | 优先使用 `tree`、`ls`、`cat`、`tail` 远端查看，只对小结果文件执行 `get` |
+
+更多细节见 [故障排查](./docs/troubleshooting.md)。
+
+## 📚 Documentation
+
+| 文档 | 内容 |
+| --- | --- |
+| [插件目录](./plugins/autodl-remote) | Codex App 插件源码 |
+| [插件说明](./plugins/autodl-remote/README.md) | CLI 命令和插件内部说明 |
+| [设计说明](./docs/design.md) | 为什么做成极简 SSH 工具层 |
+| [故障排查](./docs/troubleshooting.md) | 安装、SSH、路径、权限等问题 |
+| [更新记录](./CHANGELOG.md) | 版本变化 |
+
+## 📦 Repository Layout
 
 ```text
 .
@@ -255,7 +360,7 @@ autodl-remote account password-delete autodl-gpu
 └── LICENSE
 ```
 
-## 🤝 贡献
+## 🤝 Contributing
 
 欢迎提交 Issue 或 Pull Request。这个项目会优先保持轻量，不会加入复杂的自动同步策略。如果你想贡献新能力，建议先说明它是否仍然符合三个核心原语：
 

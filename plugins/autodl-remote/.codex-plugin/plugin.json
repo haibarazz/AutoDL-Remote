@@ -3,12 +3,11 @@
   "version": "0.5.0",
   "description": "Bash-only SSH account, command, upload, and download tool layer for AutoDL.",
   "author": {
-    "name": "Zhuanz",
-    "email": "maintainer@example.com",
-    "url": "https://github.com/Zhuanz/autodl-remote"
+    "name": "haibarazz",
+    "url": "https://github.com/haibarazz/AutoDL-Remote"
   },
-  "homepage": "https://github.com/Zhuanz/autodl-remote",
-  "repository": "https://github.com/Zhuanz/autodl-remote",
+  "homepage": "https://github.com/haibarazz/AutoDL-Remote",
+  "repository": "https://github.com/haibarazz/AutoDL-Remote",
   "license": "MIT",
   "keywords": [
     "autodl",
@@ -22,16 +21,16 @@
     "displayName": "AutoDL Remote",
     "shortDescription": "Control AutoDL over SSH from local Codex.",
     "longDescription": "Provides SSH account management, remote command execution, and explicit file upload/download primitives. Codex decides what to inspect, push, pull, and run.",
-    "developerName": "Zhuanz",
+    "developerName": "haibarazz",
     "category": "Developer Tools",
     "capabilities": [
       "Read",
       "Write",
       "Interactive"
     ],
-    "websiteURL": "https://github.com/Zhuanz/autodl-remote",
-    "privacyPolicyURL": "https://github.com/Zhuanz/autodl-remote#privacy",
-    "termsOfServiceURL": "https://github.com/Zhuanz/autodl-remote#license",
+    "websiteURL": "https://github.com/haibarazz/AutoDL-Remote",
+    "privacyPolicyURL": "https://github.com/haibarazz/AutoDL-Remote#security-notes",
+    "termsOfServiceURL": "https://github.com/haibarazz/AutoDL-Remote#license",
     "defaultPrompt": [
       "Use AutoDL Remote to inspect my remote project.",
       "Upload this edited file to AutoDL and run training.",
