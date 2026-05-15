@@ -3,7 +3,7 @@
 </div>
 
 <div align="center">
-  <img src="./docs/images/autodl-remote-hero.svg" alt="AutoDL Remote 工作原理" width="100%">
+  <img src="./docs/images/autodl-remote-hero.png" alt="AutoDL Remote 工作原理" width="100%">
   <h1>AutoDL Remote</h1>
   <h3>让 Codex 留在本地，让 GPU 在远端跑</h3>
   <p><em>一个面向 Codex App 的极简 SSH 插件：账号管理、远端命令、显式上传和下载。</em></p>
@@ -43,13 +43,13 @@
 ## 🧠 工作原理
 
 <div align="center">
-  <img src="./docs/images/autodl-remote-workflow.svg" alt="AutoDL Remote 典型工作流" width="100%">
+  <img src="./docs/images/autodl-remote-workflow.png" alt="AutoDL Remote 典型工作流" width="100%">
 </div>
 
 &emsp;&emsp;典型流程是：先查看远端项目结构，再把需要编辑的脚本拉到本地；Codex 在本地修改后，显式上传对应文件；训练或推理在远端执行；最后只查看日志或拉回必要结果。
 
 <div align="center">
-  <img src="./docs/images/autodl-remote-boundary.svg" alt="AutoDL Remote 本地远端边界" width="100%">
+  <img src="./docs/images/autodl-remote-boundary.png" alt="AutoDL Remote 本地远端边界" width="100%">
 </div>
 
 &emsp;&emsp;这个边界很重要：**本地负责代码和修改痕迹，远端负责大模型、数据集、checkpoint 和 GPU 任务。** 插件不会默认下载模型权重，也不会默认把整个远端目录同步回来。
