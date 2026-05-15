@@ -60,20 +60,36 @@ Inspect and run:
 
 ```bash
 autodl-remote doctor
+autodl-remote model-dir
 autodl-remote tree . --depth 2
 autodl-remote exec -- pwd
 autodl-remote exec -- python train.py
 autodl-remote exec --detach --name train -- python train.py
-autodl-remote tail -- .autodl-remote/logs/train.log
+autodl-remote job status train
+autodl-remote job tail train
 ```
 
 Move files only when needed:
 
 ```bash
 autodl-remote put ./train.py train.py
+autodl-remote put-run ./train.py -- python train.py
 autodl-remote get outputs/result.csv ./outputs/result.csv
 autodl-remote sync-up ./src src
 autodl-remote sync-down logs/train.log ./logs/train.log
+```
+
+Run complex local scripts without shell quoting problems:
+
+```bash
+autodl-remote exec --script scripts/remote_check.sh
+cat scripts/remote_check.sh | autodl-remote exec --stdin -- bash
+```
+
+Shutdown the remote machine after a run:
+
+```bash
+autodl-remote shutdown
 ```
 
 ## Accounts
@@ -129,8 +145,10 @@ autodl-remote account password-delete <name>
 
 autodl-remote bind [--account name] --remote /remote/project/root
 autodl-remote doctor
+autodl-remote model-dir [--mkdir]
 
-autodl-remote exec [--detach] [--cwd path] [--name name] -- <command>
+autodl-remote exec [--detach] [--cwd path] [--name name] [--script local_script] [--stdin] -- <command>
+autodl-remote put-run <local-path>... -- <command>
 autodl-remote put <local-path> [remote-path]
 autodl-remote get <remote-path> [local-path]
 autodl-remote sync-up <local-path> [remote-path]
@@ -139,6 +157,10 @@ autodl-remote tree [remote-path] [--depth 3] [--limit 500]
 autodl-remote ls [remote-path]
 autodl-remote cat [--lines 200] -- <remote-path>
 autodl-remote tail [--lines 120] [--follow] -- <remote-path>
+autodl-remote job list
+autodl-remote job status <name>
+autodl-remote job tail [--lines 120] [--follow] <name>
+autodl-remote shutdown [--wait seconds]
 autodl-remote shell
 autodl-remote history
 ```
@@ -152,3 +174,6 @@ autodl-remote history
 - No automatic push before run.
 - Use `put/get/sync-up/sync-down` explicitly.
 - Keep large models, datasets, checkpoints, and training outputs on AutoDL unless the user explicitly pulls them.
+- Use `exec --script` or `exec --stdin` for multi-line shell/Python snippets.
+- Use `job status` and `job tail` for detached training jobs created with `exec --detach --name`.
+- Use `shutdown` instead of guessing provider-specific poweroff commands.

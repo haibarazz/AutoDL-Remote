@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0
+
+- Added `autodl-remote shutdown` with shutdown/poweroff/halt fallback and SSH disconnect-aware success handling.
+- Added detached job registry commands: `job list`, `job status <name>`, and `job tail <name>`.
+- Added `exec --script <local_script>` and `exec --stdin -- <command>` for complex multi-line remote commands.
+- Added `put-run <local-path>... -- <command>` to upload selected local paths before running a remote command.
+- Added `model-dir [--mkdir]` and automatic local `.autodl-remote/CONVENTIONS.md` creation for project-level remote conventions.
+
 ## 0.5.0
 
 Initial public package.

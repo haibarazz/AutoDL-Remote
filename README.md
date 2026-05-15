@@ -38,6 +38,10 @@
 | ⬆️ 显式上传 | 用 `put` 或 `sync-up` 把本地改过的文件送到远端 |
 | ⬇️ 显式下载 | 用 `get` 或 `sync-down` 只拉回需要查看或提交的结果 |
 | 📜 日志查看 | 用 `tail` 查看远端训练日志，不必下载大文件 |
+| 🧾 Job 状态 | 用 `job status` 和 `job tail` 跟踪 `exec --detach --name` 创建的长任务 |
+| 🧠 脚本执行 | 用 `exec --script` 或 `exec --stdin` 避免复杂 quoting |
+| ⏻ 远端关机 | 用 `shutdown` 处理 AutoDL 关机和 SSH 断开返回码 |
+| 📝 项目约定 | 首次使用自动生成 `.autodl-remote/CONVENTIONS.md` 记录远端约定 |
 | 🧩 Codex 友好 | 插件不替你判断同步策略，把决策权留给用户和 Codex |
 
 ## ✅ Requirements
@@ -195,10 +199,13 @@ REMOTE_ROOT="/root/autodl-tmp/my-project"
 
 ```bash
 autodl-remote doctor
+autodl-remote model-dir
 autodl-remote tree . --depth 2
 autodl-remote exec -- pwd
 autodl-remote exec -- nvidia-smi
 ```
+
+`model-dir` 会输出项目默认模型目录；第一次执行项目命令时，本地还会自动生成 `.autodl-remote/CONVENTIONS.md`，用来记录模型目录、数据目录、运行命令等项目约定。
 
 如果这几步正常，再开始上传代码或运行训练。
 
@@ -226,11 +233,18 @@ autodl-remote exec -- nvidia-smi
 | `autodl-remote cat -- train.py` | 查看远端文件内容 |
 | `autodl-remote get train.py train.py` | 把远端文件拉到本地 |
 | `autodl-remote put train.py train.py` | 把本地文件上传到远端 |
+| `autodl-remote put-run train.py -- python train.py` | 先上传文件，再执行远端命令 |
 | `autodl-remote sync-up ./src src` | 上传本地目录 |
 | `autodl-remote sync-down outputs outputs` | 下载远端目录 |
 | `autodl-remote exec -- python train.py` | 在远端执行命令 |
+| `autodl-remote exec --script scripts/check.sh` | 上传并运行本地脚本，减少 shell quoting 问题 |
+| `cat script.sh \| autodl-remote exec --stdin -- bash` | 从 stdin 上传多行脚本并运行 |
 | `autodl-remote exec --detach --name train -- python train.py` | 远端后台运行长任务 |
-| `autodl-remote tail -- .autodl-remote/logs/train.log` | 查看远端日志 |
+| `autodl-remote job list` | 列出本地记录的远端长任务 |
+| `autodl-remote job status train` | 查看长任务 PID、日志、远端状态和退出码 |
+| `autodl-remote job tail train` | 查看命名长任务日志 |
+| `autodl-remote model-dir --mkdir` | 输出并创建项目模型目录 |
+| `autodl-remote shutdown` | 请求远端关机，并把 SSH 断开视为可能成功 |
 
 ## 📌 Usage Patterns
 
@@ -242,8 +256,21 @@ autodl-remote cat -- train.py
 autodl-remote get train.py train.py
 
 # Codex 在本地修改 train.py
-autodl-remote put train.py train.py
-autodl-remote exec -- python train.py
+autodl-remote put-run train.py -- python train.py
+```
+
+### 复杂脚本或 heredoc
+
+```bash
+autodl-remote exec --script scripts/remote_metrics.sh
+
+cat <<'SH' | autodl-remote exec --stdin -- bash
+set -euo pipefail
+pwd
+python - <<'PY'
+print("remote python ok")
+PY
+SH
 ```
 
 ### 本地已有项目
@@ -251,18 +278,47 @@ autodl-remote exec -- python train.py
 ```bash
 autodl-remote bind --account autodl-gpu --remote /root/autodl-tmp/my-project
 autodl-remote sync-up ./src src
-autodl-remote put train.py train.py
-autodl-remote exec -- python train.py
+autodl-remote put-run train.py -- python train.py
 ```
 
 ### 远端训练任务
 
 ```bash
 autodl-remote exec --detach --name train -- python train.py
-autodl-remote tail -- .autodl-remote/logs/train.log
+autodl-remote job status train
+autodl-remote job tail train
 autodl-remote cat -- outputs/metrics.json
 autodl-remote get outputs/metrics.json outputs/metrics.json
 ```
+
+### 远端关机
+
+```bash
+autodl-remote shutdown
+```
+
+`shutdown` 会先执行 `sync`，再尝试 `shutdown`、`poweroff`、`halt`，最后通过 SSH 是否还能连接来判断关机是否生效。关机导致 SSH 返回 `255` 时，会按“连接被远端关闭，可能已关机”处理。
+
+### 项目模型目录约定
+
+```bash
+autodl-remote model-dir
+autodl-remote model-dir --mkdir
+```
+
+默认规则：
+
+- 如果远端路径在 `/root/autodl-tmp` 下，默认模型目录是 `/root/autodl-tmp/models`。
+- 其他远端路径默认使用 `<REMOTE_ROOT>/models`。
+- 可在 `.autodl-remote.conf` 里设置 `MODEL_DIR="/some/path"` 覆盖。
+
+首次项目命令会在本地生成：
+
+```text
+.autodl-remote/CONVENTIONS.md
+```
+
+这个文件用于记录模型位置、数据位置、日志位置、常用运行命令等项目约定。
 
 ## ✅ What This Plugin Does Not Do
 

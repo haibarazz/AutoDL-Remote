@@ -34,9 +34,11 @@ account:
 project:
   bind [--account name] --remote /remote/project/root
   doctor
+  model-dir [--mkdir]
 
 remote:
-  exec [--detach] [--cwd path] [--name name] [--allow-dangerous] -- <command>
+  exec [--detach] [--cwd path] [--name name] [--script local_script] [--stdin] [--allow-dangerous] -- <command>
+  put-run <local-path>... -- <command>
   put <local-path> [remote-path]
   get <remote-path> [local-path]
   sync-up <local-path> [remote-path]
@@ -45,6 +47,10 @@ remote:
   ls [remote-path]
   cat [--lines 200] -- <remote-path>
   tail [--lines 120] [--follow] -- <remote-path>
+  job list
+  job status <name>
+  job tail [--lines 120] [--follow] <name>
+  shutdown [--wait seconds]
   shell
   history [--lines 20]
 
@@ -140,6 +146,79 @@ write_history() {
   printf '{"ts":"%s","action":"%s","detail":"%s"}\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "$action" "$escaped" >> "$file"
 }
 
+sanitize_name() {
+  local name="$1"
+  name="$(printf '%s' "$name" | sed 's/[^A-Za-z0-9_.-]/-/g')"
+  [ -n "$name" ] || name="job-$(date +%Y%m%d-%H%M%S)"
+  printf '%s\n' "$name"
+}
+
+config_quote() {
+  sed 's/\\/\\\\/g; s/"/\\"/g' <<EOF
+$1
+EOF
+}
+
+default_model_dir() {
+  case "$REMOTE_ROOT" in
+    /root/autodl-tmp|/root/autodl-tmp/*) printf '%s\n' "/root/autodl-tmp/models" ;;
+    *) printf '%s\n' "$REMOTE_ROOT/models" ;;
+  esac
+}
+
+ensure_project_conventions() {
+  local dir file
+  dir="$PROJECT_ROOT/$HISTORY_DIR"
+  file="$dir/CONVENTIONS.md"
+  mkdir -p "$dir"
+  [ -f "$file" ] && return 0
+  cat > "$file" <<EOF
+# AutoDL Remote Conventions
+
+This file is created locally by \`autodl-remote\` to record project-level remote workflow notes.
+
+- Account: \`$ACCOUNT_NAME\`
+- Remote root: \`$REMOTE_ROOT\`
+- Model directory: \`$PROJECT_MODEL_DIR\`
+- Large files such as models, datasets, checkpoints, and training outputs should stay remote unless explicitly pulled.
+- Edit code locally, upload selected files with \`put\` or \`sync-up\`, run on the remote GPU, then inspect logs/results remotely first.
+
+## Project Notes
+
+- Add project-specific paths, model locations, dataset locations, and run commands here.
+EOF
+}
+
+jobs_dir() {
+  printf '%s/%s/jobs\n' "$PROJECT_ROOT" "$HISTORY_DIR"
+}
+
+job_path() {
+  local name="$1"
+  valid_name "$name" || die "Invalid job name: $name"
+  printf '%s/%s.conf\n' "$(jobs_dir)" "$name"
+}
+
+write_job() {
+  local name="$1" pid="$2" log="$3" status_path="$4" cwd="$5" command="$6" file
+  mkdir -p "$(jobs_dir)"
+  file="$(job_path "$name")"
+  cat > "$file" <<EOF
+NAME="$(config_quote "$name")"
+PID="$(config_quote "$pid")"
+LOG_PATH="$(config_quote "$log")"
+STATUS_PATH="$(config_quote "$status_path")"
+CWD="$(config_quote "$cwd")"
+STARTED_AT="$(date +%Y-%m-%dT%H:%M:%S%z)"
+COMMAND="$(config_quote "$command")"
+EOF
+}
+
+job_get() {
+  local file="$1" key="$2"
+  config_get_from "$file" "$key"
+}
+
 load_account() {
   local name="$1" path
   valid_name "$name" || die "Invalid account name: $name"
@@ -185,6 +264,7 @@ load_project() {
   PROJECT_ROOT="$(cd "$(dirname "$CONFIG_PATH")" && pwd)"
   PROJECT_ACCOUNT="$(config_get_from "$CONFIG_PATH" ACCOUNT)"
   REMOTE_ROOT="$(config_get_from "$CONFIG_PATH" REMOTE_ROOT)"
+  PROJECT_MODEL_DIR="$(config_get_from "$CONFIG_PATH" MODEL_DIR)"
 
   [ -n "$PROJECT_ACCOUNT" ] || die "$CONFIG_FILE is missing ACCOUNT."
   load_account "$PROJECT_ACCOUNT"
@@ -193,6 +273,14 @@ load_project() {
   [ -n "$REMOTE_ROOT" ] || die "$CONFIG_FILE is missing REMOTE_ROOT."
   REMOTE_ROOT="${REMOTE_ROOT%/}"
   validate_remote_root "$REMOTE_ROOT"
+  [ -n "$PROJECT_MODEL_DIR" ] || PROJECT_MODEL_DIR="$(default_model_dir)"
+  case "$PROJECT_MODEL_DIR" in
+    /*) ;;
+    *) PROJECT_MODEL_DIR="$REMOTE_ROOT/${PROJECT_MODEL_DIR#./}" ;;
+  esac
+  PROJECT_MODEL_DIR="${PROJECT_MODEL_DIR%/}"
+  validate_remote_root "$PROJECT_MODEL_DIR"
+  ensure_project_conventions
 }
 
 ssh_common_args() {
@@ -316,6 +404,16 @@ remote_has_rsync() {
 ensure_remote_dir() {
   local dir="$1"
   ssh_capture "mkdir -p $(shell_quote "$dir")" >/dev/null
+}
+
+upload_local_file() {
+  local local_path="$1" remote_path="$2"
+  [ -f "$local_path" ] || die "Local script does not exist or is not a file: $local_path"
+  ensure_remote_dir "$(dirname "$remote_path")"
+  ssh_common_args
+  local scp_args=(-P "$ACCOUNT_PORT")
+  [ -n "$ACCOUNT_KEY" ] && scp_args+=(-i "$ACCOUNT_KEY")
+  run_transport scp "${scp_args[@]}" "$local_path" "$ACCOUNT_TARGET:$remote_path"
 }
 
 dangerous_command_check() {
@@ -527,28 +625,65 @@ cmd_doctor() {
 
 cmd_exec() {
   load_project
-  local detach=false cwd="$REMOTE_ROOT" name="" allow_dangerous=false
+  local detach=false cwd="$REMOTE_ROOT" name="" allow_dangerous=false script="" stdin_mode=false remote_script=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --detach) detach=true; shift ;;
       --cwd) cwd="$(remote_join "$2")"; shift 2 ;;
       --name) name="$2"; shift 2 ;;
+      --script) script="$2"; shift 2 ;;
+      --stdin) stdin_mode=true; shift ;;
       --allow-dangerous) allow_dangerous=true; shift ;;
       --) shift; break ;;
       *) break ;;
     esac
   done
-  [ $# -gt 0 ] || die "exec requires a command"
-  local cmd="$*"
+  [ "$stdin_mode" != "true" ] || [ -z "$script" ] || die "Use either --script or --stdin, not both."
+
+  local cmd="" tmp_name result pid status_path remote_cmd detach_rc
+  if [ -n "$script" ]; then
+    local local_script
+    local_script="$(local_join "$script")"
+    tmp_name="$(date +%Y%m%d-%H%M%S)-$(basename "$script" | sed 's/[^A-Za-z0-9_.-]/-/g')"
+    remote_script="$REMOTE_ROOT/.autodl-remote/tmp/$tmp_name"
+    upload_local_file "$local_script" "$remote_script"
+    if [ $# -gt 0 ]; then
+      cmd="$* $(shell_quote "$remote_script")"
+    else
+      cmd="bash $(shell_quote "$remote_script")"
+    fi
+  elif [ "$stdin_mode" = "true" ]; then
+    [ $# -gt 0 ] || die "exec --stdin requires a command after --, for example: exec --stdin -- bash"
+    local tmp_local
+    tmp_local="$(mktemp "${TMPDIR:-/tmp}/autodl-remote-stdin.XXXXXX")" || die "mktemp failed"
+    cat > "$tmp_local"
+    tmp_name="$(date +%Y%m%d-%H%M%S)-stdin.sh"
+    remote_script="$REMOTE_ROOT/.autodl-remote/tmp/$tmp_name"
+    upload_local_file "$tmp_local" "$remote_script"
+    rm -f "$tmp_local"
+    cmd="$* < $(shell_quote "$remote_script")"
+  else
+    [ $# -gt 0 ] || die "exec requires a command"
+    cmd="$*"
+  fi
+
   if [ "$allow_dangerous" != "true" ]; then
     dangerous_command_check "$cmd" || die "Dangerous remote command blocked. Re-run with --allow-dangerous after explicit approval."
   fi
   [ -n "$name" ] || name="exec-$(date +%Y%m%d-%H%M%S)"
-  name="$(printf '%s' "$name" | sed 's/[^A-Za-z0-9_.-]/-/g')"
+  name="$(sanitize_name "$name")"
   local log="$REMOTE_ROOT/.autodl-remote/logs/$name.log"
+  status_path="$REMOTE_ROOT/.autodl-remote/jobs/$name.status"
   info "log=$log"
   if [ "$detach" = "true" ]; then
-    ssh_capture "mkdir -p $(shell_quote "$(dirname "$log")") && cd $(shell_quote "$cwd") && nohup bash -lc $(shell_quote "$cmd") > $(shell_quote "$log") 2>&1 < /dev/null & printf 'pid=%s\nlog=%s\n' \"\$!\" $(shell_quote "$log")"
+    remote_cmd="mkdir -p $(shell_quote "$(dirname "$log")") $(shell_quote "$(dirname "$status_path")") && ( started_at=\$(date +%Y-%m-%dT%H:%M:%S%z); pid=\$BASHPID; printf 'status=running\npid=%s\nstarted_at=%s\nlog=%s\ncwd=%s\n' \"\$pid\" \"\$started_at\" $(shell_quote "$log") $(shell_quote "$cwd") > $(shell_quote "$status_path"); cd $(shell_quote "$cwd") && bash -lc $(shell_quote "$cmd") > $(shell_quote "$log") 2>&1; rc=\$?; finished_at=\$(date +%Y-%m-%dT%H:%M:%S%z); printf 'status=exited\npid=%s\nstarted_at=%s\nfinished_at=%s\nexit_code=%s\nlog=%s\ncwd=%s\n' \"\$pid\" \"\$started_at\" \"\$finished_at\" \"\$rc\" $(shell_quote "$log") $(shell_quote "$cwd") > $(shell_quote "$status_path"); ) < /dev/null & printf 'pid=%s\nlog=%s\nstatus=%s\n' \"\$!\" $(shell_quote "$log") $(shell_quote "$status_path")"
+    result="$(ssh_capture "bash -lc $(shell_quote "$remote_cmd")" 2>&1)"
+    detach_rc=$?
+    printf '%s\n' "$result"
+    [ "$detach_rc" -eq 0 ] || return "$detach_rc"
+    pid="$(printf '%s\n' "$result" | awk -F= '$1=="pid"{print $2; exit}')"
+    [ -n "$pid" ] || die "Remote detach did not return a pid."
+    write_job "$name" "$pid" "$log" "$status_path" "$cwd" "$cmd"
     write_history exec-detach "$cmd log=$log"
   else
     local inner rc
@@ -703,6 +838,159 @@ cmd_tail() {
   ssh_run "tail -n $lines $flag $(shell_quote "$(remote_join "$1")")"
 }
 
+cmd_job_list() {
+  load_project
+  local dir file name pid started log command seen=false
+  dir="$(jobs_dir)"
+  mkdir -p "$dir"
+  if ls "$dir"/*.conf >/dev/null 2>&1; then
+    printf '%-24s %-10s %-24s %s\n' "name" "pid" "started_at" "log"
+    for file in "$dir"/*.conf; do
+      seen=true
+      name="$(job_get "$file" NAME)"
+      pid="$(job_get "$file" PID)"
+      started="$(job_get "$file" STARTED_AT)"
+      log="$(job_get "$file" LOG_PATH)"
+      command="$(job_get "$file" COMMAND)"
+      printf '%-24s %-10s %-24s %s\n' "$name" "$pid" "$started" "$log"
+      [ -n "$command" ] && printf '  command: %s\n' "$command"
+    done
+  fi
+  [ "$seen" = "true" ] || info "No jobs recorded."
+}
+
+cmd_job_status() {
+  load_project
+  [ $# -gt 0 ] || die "job status requires a name"
+  local name file pid log status_path cwd command remote_status rc
+  name="$(sanitize_name "$1")"
+  file="$(job_path "$name")"
+  [ -f "$file" ] || die "Job not found: $name"
+  pid="$(job_get "$file" PID)"
+  log="$(job_get "$file" LOG_PATH)"
+  status_path="$(job_get "$file" STATUS_PATH)"
+  cwd="$(job_get "$file" CWD)"
+  command="$(job_get "$file" COMMAND)"
+  [ -n "$pid" ] || die "Job has no recorded pid: $name"
+
+  info "name=$name"
+  info "pid=$pid"
+  info "cwd=$cwd"
+  info "log=$log"
+  info "status_path=$status_path"
+  info "command=$command"
+  remote_status="$(ssh_capture "if [ -f $(shell_quote "$status_path") ]; then cat $(shell_quote "$status_path"); elif kill -0 $(shell_quote "$pid") 2>/dev/null; then printf 'status=running\npid=%s\n' $(shell_quote "$pid"); else printf 'status=unknown\npid=%s\n' $(shell_quote "$pid"); fi; if kill -0 $(shell_quote "$pid") 2>/dev/null; then echo alive=yes; else echo alive=no; fi" 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf '%s\n' "$remote_status"
+  else
+    info "remote_status=unreachable"
+    printf '%s\n' "$remote_status" >&2
+    return "$rc"
+  fi
+}
+
+cmd_job_tail() {
+  load_project
+  local lines=120 follow=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --lines) lines="$2"; shift 2 ;;
+      --follow|-f) follow=true; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "job tail requires a name"
+  local name file log flag=""
+  name="$(sanitize_name "$1")"
+  file="$(job_path "$name")"
+  [ -f "$file" ] || die "Job not found: $name"
+  log="$(job_get "$file" LOG_PATH)"
+  [ "$follow" = "true" ] && flag="-f"
+  ssh_run "tail -n $lines $flag $(shell_quote "$log")"
+}
+
+cmd_job() {
+  [ $# -gt 0 ] || die "job requires a subcommand"
+  local sub="$1"
+  shift
+  case "$sub" in
+    list|ls) cmd_job_list "$@" ;;
+    status) cmd_job_status "$@" ;;
+    tail) cmd_job_tail "$@" ;;
+    *) die "unknown job command: $sub" ;;
+  esac
+}
+
+cmd_shutdown() {
+  load_project
+  local wait_seconds=8 output rc
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --wait) wait_seconds="$2"; shift 2 ;;
+      *) die "unknown shutdown option: $1" ;;
+    esac
+  done
+
+  info "Requesting remote shutdown for $ACCOUNT_TARGET:$ACCOUNT_PORT"
+  output="$(ssh_capture "sync || true; if command -v shutdown >/dev/null 2>&1; then echo method=shutdown; nohup shutdown >/dev/null 2>&1 </dev/null & elif command -v poweroff >/dev/null 2>&1; then echo method=poweroff; nohup poweroff >/dev/null 2>&1 </dev/null & elif command -v halt >/dev/null 2>&1; then echo method=halt; nohup halt >/dev/null 2>&1 </dev/null & else echo method=missing; exit 127; fi" 2>&1)"
+  rc=$?
+  [ -n "$output" ] && printf '%s\n' "$output"
+
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 255 ]; then
+    info "shutdown_request=failed rc=$rc"
+    return "$rc"
+  fi
+  if [ "$rc" -eq 255 ]; then
+    info "shutdown_request=connection_closed rc=255"
+  else
+    info "shutdown_request=sent rc=$rc"
+  fi
+
+  sleep "$wait_seconds"
+  if ssh_capture "true" >/dev/null 2>&1; then
+    info "shutdown_status=still_reachable"
+    info "Remote is still reachable; shutdown may not have taken effect."
+    return 1
+  fi
+  info "shutdown_status=disconnected"
+  info "SSH is disconnected; remote is likely shutting down or already powered off."
+  write_history shutdown "wait=$wait_seconds rc=$rc"
+}
+
+cmd_model_dir() {
+  load_project
+  local create=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mkdir) create=true; shift ;;
+      *) die "unknown model-dir option: $1" ;;
+    esac
+  done
+  if [ "$create" = "true" ]; then
+    ensure_remote_dir "$PROJECT_MODEL_DIR"
+  fi
+  info "$PROJECT_MODEL_DIR"
+}
+
+cmd_put_run() {
+  local uploads=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) shift; break ;;
+      *) uploads+=("$1"); shift ;;
+    esac
+  done
+  [ "${#uploads[@]}" -gt 0 ] || die "put-run requires at least one local path before --"
+  [ $# -gt 0 ] || die "put-run requires a command after --"
+  local path
+  for path in "${uploads[@]}"; do
+    cmd_put "$path"
+  done
+  cmd_exec -- "$@"
+}
+
 cmd_shell() {
   load_project
   ssh_common_args
@@ -732,13 +1020,17 @@ main() {
     account) cmd_account "$@" ;;
     bind) cmd_bind "$@" ;;
     doctor) cmd_doctor "$@" ;;
+    model-dir) cmd_model_dir "$@" ;;
     exec) cmd_exec "$@" ;;
+    put-run) cmd_put_run "$@" ;;
     put|sync-up) cmd_put "$@" ;;
     get|sync-down) cmd_get "$@" ;;
     tree) cmd_tree "$@" ;;
     ls) cmd_ls "$@" ;;
     cat) cmd_cat "$@" ;;
     tail) cmd_tail "$@" ;;
+    job) cmd_job "$@" ;;
+    shutdown) cmd_shutdown "$@" ;;
     shell) cmd_shell "$@" ;;
     history) cmd_history "$@" ;;
     *) die "unknown command: $cmd" ;;

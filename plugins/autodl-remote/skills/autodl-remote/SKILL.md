@@ -15,6 +15,8 @@ Use this skill when the user wants Codex to work locally while controlling AutoD
 - Codex decides the smallest useful action each time: inspect, upload, download, run, or tail logs.
 - Do not download LLM weights, checkpoints, datasets, or large outputs unless the user explicitly asks.
 - Prefer reading remote files/logs in place with `cat`, `tail`, `ls`, and `tree`.
+- Use detached job commands for long training runs instead of manually guessing process state.
+- Use `shutdown` when the user asks to stop the remote machine; treat SSH disconnect during shutdown as likely success.
 
 ## Setup
 
@@ -38,12 +40,14 @@ The project config should only contain `ACCOUNT` and `REMOTE_ROOT`.
 
 ```bash
 autodl-remote doctor
+autodl-remote model-dir
 autodl-remote tree . --depth 2
 autodl-remote ls .
 autodl-remote cat -- README.md
 autodl-remote tail -- logs/train.log
 
 autodl-remote put ./train.py train.py
+autodl-remote put-run ./train.py -- python train.py
 autodl-remote get outputs/result.csv ./outputs/result.csv
 autodl-remote sync-up ./src src
 autodl-remote sync-down logs/train.log ./logs/train.log
@@ -51,6 +55,12 @@ autodl-remote sync-down logs/train.log ./logs/train.log
 autodl-remote exec -- pwd
 autodl-remote exec -- python train.py
 autodl-remote exec --detach --name train -- python train.py
+autodl-remote exec --script scripts/remote_check.sh
+cat scripts/remote_check.sh | autodl-remote exec --stdin -- bash
+autodl-remote job list
+autodl-remote job status train
+autodl-remote job tail train
+autodl-remote shutdown
 ```
 
 ## Behavior Rules
@@ -60,4 +70,9 @@ autodl-remote exec --detach --name train -- python train.py
 - After remote execution, inspect logs remotely first; pull only small result files when useful.
 - If both local and remote have similar files, do not assume one should overwrite the other. Compare or inspect first, then choose `put` or `get`.
 - Use `exec --detach` for long training jobs and then `tail` the log path.
+- Prefer `job status <name>` and `job tail <name>` for detached jobs created with `--name`.
+- Prefer `exec --script` or `exec --stdin` for complex multi-line commands, Python heredocs, env vars, JSON, awk, or sed.
+- Use `put-run` when the workflow is "upload these local paths, then immediately run this remote command".
+- `model-dir` prints the project model directory convention. The first project command creates `.autodl-remote/CONVENTIONS.md` locally for project notes.
+- `shutdown` first syncs the remote filesystem, then tries provider-safe shutdown methods, waits, and verifies that SSH disconnects.
 - Treat broad destructive commands as dangerous; require explicit user approval before using `--allow-dangerous`.
