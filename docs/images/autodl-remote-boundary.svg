@@ -1,0 +1,62 @@
+<svg width="1280" height="520" viewBox="0 0 1280 520" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1280" y2="520" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FAFAFA"/>
+      <stop offset="1" stop-color="#F8FAFC"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#0F172A" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto">
+      <path d="M2 2L10 6L2 10V2Z" fill="#2563EB"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto">
+      <path d="M2 2L10 6L2 10V2Z" fill="#16A34A"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="520" rx="34" fill="url(#bg)"/>
+  <text x="640" y="72" text-anchor="middle" fill="#0F172A" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="34" font-weight="800">本地和远端的边界</text>
+  <text x="640" y="107" text-anchor="middle" fill="#64748B" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="19">代码痕迹留在本地，大文件和 GPU 任务留在远端，中间只传你明确选择的路径</text>
+
+  <g filter="url(#shadow)">
+    <rect x="90" y="150" width="402" height="270" rx="28" fill="#EFF6FF" stroke="#93C5FD" stroke-width="2"/>
+    <text x="291" y="195" text-anchor="middle" fill="#1E3A8A" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="25" font-weight="800">本地项目</text>
+    <rect x="132" y="224" width="318" height="38" rx="12" fill="#FFFFFF" stroke="#BFDBFE"/>
+    <text x="154" y="249" fill="#1D4ED8" font-family="SFMono-Regular,Consolas,monospace" font-size="16">src/ train.py notebooks/</text>
+    <rect x="132" y="278" width="318" height="38" rx="12" fill="#FFFFFF" stroke="#BFDBFE"/>
+    <text x="154" y="303" fill="#1D4ED8" font-family="SFMono-Regular,Consolas,monospace" font-size="16">.git diff / commits</text>
+    <rect x="132" y="332" width="318" height="38" rx="12" fill="#FFFFFF" stroke="#BFDBFE"/>
+    <text x="154" y="357" fill="#1D4ED8" font-family="SFMono-Regular,Consolas,monospace" font-size="16">.autodl-remote.conf</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="788" y="150" width="402" height="270" rx="28" fill="#ECFDF5" stroke="#86EFAC" stroke-width="2"/>
+    <text x="989" y="195" text-anchor="middle" fill="#14532D" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="25" font-weight="800">远端项目</text>
+    <rect x="830" y="224" width="318" height="38" rx="12" fill="#FFFFFF" stroke="#BBF7D0"/>
+    <text x="852" y="249" fill="#15803D" font-family="SFMono-Regular,Consolas,monospace" font-size="16">/root/autodl-tmp/project</text>
+    <rect x="830" y="278" width="318" height="38" rx="12" fill="#FFFFFF" stroke="#BBF7D0"/>
+    <text x="852" y="303" fill="#15803D" font-family="SFMono-Regular,Consolas,monospace" font-size="16">models/ data/ checkpoints/</text>
+    <rect x="830" y="332" width="318" height="38" rx="12" fill="#FFFFFF" stroke="#BBF7D0"/>
+    <text x="852" y="357" fill="#15803D" font-family="SFMono-Regular,Consolas,monospace" font-size="16">logs/ outputs/ metrics</text>
+  </g>
+
+  <g>
+    <rect x="558" y="176" width="164" height="168" rx="26" fill="#111827"/>
+    <text x="640" y="222" text-anchor="middle" fill="#FFFFFF" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="800">SSH</text>
+    <text x="640" y="258" text-anchor="middle" fill="#CBD5E1" font-family="SFMono-Regular,Consolas,monospace" font-size="15">put / get</text>
+    <text x="640" y="286" text-anchor="middle" fill="#CBD5E1" font-family="SFMono-Regular,Consolas,monospace" font-size="15">exec / tail</text>
+    <text x="640" y="318" text-anchor="middle" fill="#FDE68A" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="14">不自动同步</text>
+  </g>
+
+  <path d="M500 230H548" stroke="#2563EB" stroke-width="5" stroke-linecap="round" marker-end="url(#arrowBlue)"/>
+  <path d="M732 230H780" stroke="#2563EB" stroke-width="5" stroke-linecap="round" marker-end="url(#arrowBlue)"/>
+  <text x="640" y="145" text-anchor="middle" fill="#1D4ED8" font-family="SFMono-Regular,Consolas,monospace" font-size="16" font-weight="700">上传你决定的代码文件</text>
+
+  <path d="M780 312H732" stroke="#16A34A" stroke-width="5" stroke-linecap="round" marker-end="url(#arrowGreen)"/>
+  <path d="M548 312H500" stroke="#16A34A" stroke-width="5" stroke-linecap="round" marker-end="url(#arrowGreen)"/>
+  <text x="640" y="392" text-anchor="middle" fill="#15803D" font-family="SFMono-Regular,Consolas,monospace" font-size="16" font-weight="700">只拉回需要查看或提交的结果</text>
+
+  <rect x="288" y="452" width="704" height="42" rx="21" fill="#FFFFFF" stroke="#CBD5E1"/>
+  <text x="640" y="479" text-anchor="middle" fill="#334155" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="17">模型权重、数据集、checkpoint 默认不回传，除非你明确 get 或 sync-down</text>
+</svg>

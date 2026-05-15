@@ -1,0 +1,748 @@
+#!/usr/bin/env bash
+set -u
+
+PROGRAM="autodl-remote"
+APP_DIR="$HOME/.autodl-remote"
+ACCOUNTS_DIR="$APP_DIR/accounts"
+DEFAULT_ACCOUNT_FILE="$APP_DIR/default-account"
+CONFIG_FILE=".autodl-remote.conf"
+HISTORY_DIR=".autodl-remote"
+KEYCHAIN_SERVICE="autodl-remote"
+
+die() {
+  printf '%s: %s\n' "$PROGRAM" "$*" >&2
+  exit 2
+}
+
+info() {
+  printf '%s\n' "$*"
+}
+
+usage() {
+  cat <<'EOF'
+usage: autodl-remote <command> [options]
+
+account:
+  account add <name> [--target root@host | --host host --user root] [--port 22] [--key path] [--auth prompt|keychain|ssh-key] [--default-remote path]
+  account list
+  account show <name>
+  account use <name>
+  account test [name]
+  account password-save <name>
+  account password-delete <name>
+
+project:
+  bind [--account name] --remote /remote/project/root
+  doctor
+
+remote:
+  exec [--detach] [--cwd path] [--name name] [--allow-dangerous] -- <command>
+  put <local-path> [remote-path]
+  get <remote-path> [local-path]
+  sync-up <local-path> [remote-path]
+  sync-down <remote-path> [local-path]
+  tree [remote-path] [--depth 3] [--limit 500]
+  ls [remote-path]
+  cat [--lines 200] -- <remote-path>
+  tail [--lines 120] [--follow] -- <remote-path>
+  shell
+  history [--lines 20]
+
+EOF
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+strip_quotes() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  value="${value%%#*}"
+  value="${value%"${value##*[![:space:]]}"}"
+  case "$value" in
+    \"*\") value="${value#\"}"; value="${value%\"}" ;;
+    \'*\') value="${value#\'}"; value="${value%\'}" ;;
+  esac
+  printf '%s' "$value"
+}
+
+json_escape() {
+  sed 's/\\/\\\\/g; s/"/\\"/g' <<EOF
+$1
+EOF
+}
+
+valid_name() {
+  case "$1" in
+    ""|*/*|*..*|*[\ \	]*) return 1 ;;
+  esac
+  return 0
+}
+
+ensure_app_dirs() {
+  mkdir -p "$ACCOUNTS_DIR" "$APP_DIR"
+}
+
+account_path() {
+  local name="$1"
+  valid_name "$name" || die "Invalid account name: $name"
+  ensure_app_dirs
+  printf '%s/%s.conf\n' "$ACCOUNTS_DIR" "$name"
+}
+
+config_get_from() {
+  local file="$1" key="$2"
+  awk -F= -v key="$key" '
+    $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      sub(/^[^=]*=/, "", $0)
+      print $0
+      exit
+    }
+  ' "$file" | while IFS= read -r line; do strip_quotes "$line"; done
+}
+
+find_project_config() {
+  if [ -n "${AUTODL_REMOTE_CONFIG:-}" ]; then
+    [ -f "$AUTODL_REMOTE_CONFIG" ] || die "AUTODL_REMOTE_CONFIG points to a missing file: $AUTODL_REMOTE_CONFIG"
+    printf '%s\n' "$AUTODL_REMOTE_CONFIG"
+    return 0
+  fi
+
+  local dir
+  dir="$(pwd)"
+  while :; do
+    if [ -f "$dir/$CONFIG_FILE" ]; then
+      printf '%s\n' "$dir/$CONFIG_FILE"
+      return 0
+    fi
+    [ "$dir" = "/" ] && break
+    dir="$(dirname "$dir")"
+  done
+  die "No $CONFIG_FILE found. Run 'autodl-remote bind --account <name> --remote <path>'."
+}
+
+validate_remote_root() {
+  local root="${1%/}"
+  [ "${root#/}" != "$root" ] || die "remote path must be absolute: $root"
+  [ "$root" != "/" ] || die "remote path is too broad: /"
+  case "$root" in
+    *"/../"*|*/..) die "remote path cannot contain '..': $root" ;;
+  esac
+}
+
+write_history() {
+  local action="$1" detail="$2" file escaped
+  mkdir -p "$PROJECT_ROOT/$HISTORY_DIR"
+  file="$PROJECT_ROOT/$HISTORY_DIR/history.jsonl"
+  escaped="$(json_escape "$detail")"
+  printf '{"ts":"%s","action":"%s","detail":"%s"}\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "$action" "$escaped" >> "$file"
+}
+
+load_account() {
+  local name="$1" path
+  valid_name "$name" || die "Invalid account name: $name"
+  path="$(account_path "$name")"
+  [ -f "$path" ] || die "Account not found: $name"
+
+  ACCOUNT_NAME="$name"
+  ACCOUNT_FILE="$path"
+  ACCOUNT_HOST="$(config_get_from "$path" HOST)"
+  ACCOUNT_USER="$(config_get_from "$path" USER)"
+  ACCOUNT_TARGET="$(config_get_from "$path" TARGET)"
+  ACCOUNT_PORT="$(config_get_from "$path" PORT)"
+  ACCOUNT_KEY="$(config_get_from "$path" KEY)"
+  ACCOUNT_AUTH="$(config_get_from "$path" AUTH)"
+  ACCOUNT_DEFAULT_REMOTE="$(config_get_from "$path" DEFAULT_REMOTE)"
+
+  if [ -z "$ACCOUNT_TARGET" ]; then
+    [ -n "$ACCOUNT_HOST" ] || die "Account $name is missing HOST/TARGET."
+    [ -n "$ACCOUNT_USER" ] || die "Account $name is missing USER/TARGET."
+    ACCOUNT_TARGET="$ACCOUNT_USER@$ACCOUNT_HOST"
+  fi
+  ACCOUNT_PORT="${ACCOUNT_PORT:-22}"
+  ACCOUNT_KEY="${ACCOUNT_KEY:-}"
+  ACCOUNT_AUTH="${ACCOUNT_AUTH:-prompt}"
+  ACCOUNT_DEFAULT_REMOTE="${ACCOUNT_DEFAULT_REMOTE:-}"
+
+  case "$ACCOUNT_AUTH" in
+    prompt|keychain|ssh-key) ;;
+    *) die "Account $name has invalid AUTH: $ACCOUNT_AUTH" ;;
+  esac
+}
+
+default_account() {
+  if [ -f "$DEFAULT_ACCOUNT_FILE" ]; then
+    sed -n '1p' "$DEFAULT_ACCOUNT_FILE"
+    return 0
+  fi
+  return 1
+}
+
+load_project() {
+  CONFIG_PATH="$(find_project_config)"
+  PROJECT_ROOT="$(cd "$(dirname "$CONFIG_PATH")" && pwd)"
+  PROJECT_ACCOUNT="$(config_get_from "$CONFIG_PATH" ACCOUNT)"
+  REMOTE_ROOT="$(config_get_from "$CONFIG_PATH" REMOTE_ROOT)"
+
+  [ -n "$PROJECT_ACCOUNT" ] || die "$CONFIG_FILE is missing ACCOUNT."
+  load_account "$PROJECT_ACCOUNT"
+
+  [ -n "$REMOTE_ROOT" ] || REMOTE_ROOT="$ACCOUNT_DEFAULT_REMOTE"
+  [ -n "$REMOTE_ROOT" ] || die "$CONFIG_FILE is missing REMOTE_ROOT."
+  REMOTE_ROOT="${REMOTE_ROOT%/}"
+  validate_remote_root "$REMOTE_ROOT"
+}
+
+ssh_common_args() {
+  SSH_ARGS=(-p "$ACCOUNT_PORT" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPersist=600 -o "ControlPath=$APP_DIR/ssh-%C")
+  mkdir -p "$APP_DIR"
+  [ -n "$ACCOUNT_KEY" ] && SSH_ARGS+=(-i "$ACCOUNT_KEY")
+  if [ "$ACCOUNT_AUTH" != "keychain" ] && [ "$ACCOUNT_AUTH" != "prompt" ]; then
+    SSH_ARGS+=(-o BatchMode=yes)
+  fi
+}
+
+rsync_ssh_command() {
+  local cmd
+  cmd="ssh -p $(shell_quote "$ACCOUNT_PORT") -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPersist=600 -o ControlPath=$(shell_quote "$APP_DIR/ssh-%C")"
+  [ -n "$ACCOUNT_KEY" ] && cmd="$cmd -i $(shell_quote "$ACCOUNT_KEY")"
+  if [ "$ACCOUNT_AUTH" != "keychain" ] && [ "$ACCOUNT_AUTH" != "prompt" ]; then
+    cmd="$cmd -o BatchMode=yes"
+  fi
+  printf '%s\n' "$cmd"
+}
+
+keychain_password() {
+  command -v security >/dev/null 2>&1 || die "macOS security command is not available."
+  security find-generic-password -a "$ACCOUNT_NAME" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null
+}
+
+expect_with_password() {
+  command -v expect >/dev/null 2>&1 || die "Account uses keychain auth, but expect is not available."
+  local password="$1"
+  shift
+  AUTODL_REMOTE_PASSWORD="$password" expect -c '
+    set timeout -1
+    set password $env(AUTODL_REMOTE_PASSWORD)
+    spawn {*}$argv
+    expect {
+      -re "(?i)are you sure you want to continue connecting" {
+        send "yes\r"
+        exp_continue
+      }
+      -re "(?i)password:" {
+        send "$password\r"
+        exp_continue
+      }
+      eof
+    }
+    catch wait result
+    exit [lindex $result 3]
+  ' "$@"
+}
+
+run_transport() {
+  if [ "$ACCOUNT_AUTH" = "keychain" ]; then
+    local password
+    password="$(keychain_password)" || die "No Keychain password saved for account: $ACCOUNT_NAME"
+    expect_with_password "$password" "$@"
+  else
+    "$@"
+  fi
+}
+
+ssh_run() {
+  local command="$1"
+  ssh_common_args
+  run_transport ssh "${SSH_ARGS[@]}" "$ACCOUNT_TARGET" "$command"
+}
+
+ssh_capture() {
+  local command="$1"
+  ssh_common_args
+  run_transport ssh "${SSH_ARGS[@]}" "$ACCOUNT_TARGET" "$command"
+}
+
+remote_join() {
+  local path="${1:-.}"
+  if [ -z "$path" ] || [ "$path" = "." ]; then
+    printf '%s\n' "$REMOTE_ROOT"
+    return 0
+  fi
+  case "$path" in
+    /*)
+      validate_remote_root "$path"
+      printf '%s\n' "${path%/}"
+      ;;
+    ../*|*/../*|..)
+      die "path cannot escape remote root: $path"
+      ;;
+    *)
+      printf '%s/%s\n' "$REMOTE_ROOT" "${path#./}"
+      ;;
+  esac
+}
+
+remote_rel_for_local() {
+  local path="$1"
+  case "$path" in
+    /*)
+      if [ "${path#"$PROJECT_ROOT"/}" != "$path" ]; then
+        printf '%s\n' "${path#"$PROJECT_ROOT"/}"
+      else
+        basename "$path"
+      fi
+      ;;
+    *)
+      printf '%s\n' "${path#./}"
+      ;;
+  esac
+}
+
+local_join() {
+  local path="$1"
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    *) printf '%s/%s\n' "$PROJECT_ROOT" "${path#./}" ;;
+  esac
+}
+
+remote_has_rsync() {
+  ssh_capture "command -v rsync >/dev/null 2>&1" >/dev/null 2>&1
+}
+
+ensure_remote_dir() {
+  local dir="$1"
+  ssh_capture "mkdir -p $(shell_quote "$dir")" >/dev/null
+}
+
+dangerous_command_check() {
+  local cmd="$1"
+  case "$cmd" in
+    *"rm -rf /"*|*"mkfs"*|*"shutdown"*|*"reboot"*|*"poweroff"*|*"dd if="*)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+cmd_account_add() {
+  local name="" target="" host="" user="" port="22" key="" auth="prompt" default_remote="" force=false
+  [ $# -gt 0 ] || die "account add requires a name"
+  name="$1"
+  shift
+  valid_name "$name" || die "Invalid account name: $name"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --target) target="$2"; shift 2 ;;
+      --host) host="$2"; shift 2 ;;
+      --user) user="$2"; shift 2 ;;
+      --port) port="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      --auth) auth="$2"; shift 2 ;;
+      --default-remote) default_remote="$2"; shift 2 ;;
+      --force) force=true; shift ;;
+      *) die "unknown account add option: $1" ;;
+    esac
+  done
+
+  if [ -z "$target" ]; then
+    if [ -z "$host" ] && [ -t 0 ]; then
+      printf 'host: '
+      read -r host
+    fi
+    if [ -z "$user" ] && [ -t 0 ]; then
+      printf 'user [root]: '
+      read -r user
+      user="${user:-root}"
+    fi
+    [ -n "$host" ] || die "account add requires --target or --host."
+    [ -n "$user" ] || user="root"
+    target="$user@$host"
+  fi
+
+  case "$auth" in
+    prompt|keychain|ssh-key) ;;
+    *) die "--auth must be prompt, keychain, or ssh-key" ;;
+  esac
+  [ -z "$default_remote" ] || validate_remote_root "$default_remote"
+  [ "$auth" != "ssh-key" ] || [ -n "$key" ] || die "--auth ssh-key requires --key"
+
+  local path
+  path="$(account_path "$name")"
+  [ ! -f "$path" ] || [ "$force" = "true" ] || die "Account already exists: $name. Use --force to overwrite."
+  cat > "$path" <<EOF
+TARGET="$target"
+PORT="$port"
+KEY="$key"
+AUTH="$auth"
+DEFAULT_REMOTE="$default_remote"
+EOF
+  chmod 600 "$path"
+  info "Saved account: $name"
+}
+
+cmd_account_list() {
+  ensure_app_dirs
+  local seen=false file name
+  if ls "$ACCOUNTS_DIR"/*.conf >/dev/null 2>&1; then
+    for file in "$ACCOUNTS_DIR"/*.conf; do
+      seen=true
+      name="$(basename "$file" .conf)"
+      if [ "$(default_account 2>/dev/null || true)" = "$name" ]; then
+        printf '* %s\n' "$name"
+      else
+        printf '  %s\n' "$name"
+      fi
+    done
+  fi
+  [ "$seen" = "true" ] || info "No accounts saved."
+}
+
+cmd_account_show() {
+  [ $# -gt 0 ] || die "account show requires a name"
+  load_account "$1"
+  info "name=$ACCOUNT_NAME"
+  info "target=$ACCOUNT_TARGET"
+  info "port=$ACCOUNT_PORT"
+  info "key=$ACCOUNT_KEY"
+  info "auth=$ACCOUNT_AUTH"
+  info "default_remote=$ACCOUNT_DEFAULT_REMOTE"
+}
+
+cmd_account_use() {
+  [ $# -gt 0 ] || die "account use requires a name"
+  load_account "$1"
+  ensure_app_dirs
+  printf '%s\n' "$ACCOUNT_NAME" > "$DEFAULT_ACCOUNT_FILE"
+  info "Default account: $ACCOUNT_NAME"
+}
+
+cmd_account_test() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    name="$(default_account)" || die "No default account. Run 'autodl-remote account use <name>'."
+  fi
+  load_account "$name"
+  info "Testing $ACCOUNT_NAME -> $ACCOUNT_TARGET:$ACCOUNT_PORT"
+  ssh_capture "printf 'host=' && hostname && printf 'pwd=' && pwd && printf 'rsync=' && { command -v rsync || true; }"
+}
+
+cmd_account_password_save() {
+  [ $# -gt 0 ] || die "account password-save requires a name"
+  load_account "$1"
+  command -v security >/dev/null 2>&1 || die "macOS security command is not available."
+  local password=""
+  if [ -n "${AUTODL_REMOTE_PASSWORD:-}" ]; then
+    password="$AUTODL_REMOTE_PASSWORD"
+  else
+    [ -t 0 ] || die "Set AUTODL_REMOTE_PASSWORD or run from an interactive terminal."
+    printf 'password for %s: ' "$ACCOUNT_NAME" >&2
+    stty -echo
+    read -r password
+    stty echo
+    printf '\n' >&2
+  fi
+  [ -n "$password" ] || die "Empty password not saved."
+  security add-generic-password -U -a "$ACCOUNT_NAME" -s "$KEYCHAIN_SERVICE" -w "$password" >/dev/null
+  local path
+  path="$(account_path "$ACCOUNT_NAME")"
+  if [ ! -f "$path" ]; then
+    local add_args=("$ACCOUNT_NAME" --target "$ACCOUNT_TARGET" --port "$ACCOUNT_PORT" --auth keychain --default-remote "$ACCOUNT_DEFAULT_REMOTE" --force)
+    [ -n "$ACCOUNT_KEY" ] && add_args+=(--key "$ACCOUNT_KEY")
+    cmd_account_add "${add_args[@]}" >/dev/null
+  else
+    awk -F= 'BEGIN{done=0} $1=="AUTH"{print "AUTH=\"keychain\""; done=1; next} {print} END{if(!done) print "AUTH=\"keychain\""}' "$path" > "$path.tmp"
+    mv "$path.tmp" "$path"
+    chmod 600 "$path"
+  fi
+  info "Saved password in macOS Keychain for account: $ACCOUNT_NAME"
+}
+
+cmd_account_password_delete() {
+  [ $# -gt 0 ] || die "account password-delete requires a name"
+  load_account "$1"
+  command -v security >/dev/null 2>&1 || die "macOS security command is not available."
+  security delete-generic-password -a "$ACCOUNT_NAME" -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1 || true
+  info "Deleted Keychain password for account: $ACCOUNT_NAME"
+}
+
+cmd_account() {
+  [ $# -gt 0 ] || die "account requires a subcommand"
+  local sub="$1"
+  shift
+  case "$sub" in
+    add) cmd_account_add "$@" ;;
+    list|ls) cmd_account_list "$@" ;;
+    show) cmd_account_show "$@" ;;
+    use) cmd_account_use "$@" ;;
+    test) cmd_account_test "$@" ;;
+    password-save) cmd_account_password_save "$@" ;;
+    password-delete) cmd_account_password_delete "$@" ;;
+    *) die "unknown account command: $sub" ;;
+  esac
+}
+
+cmd_bind() {
+  local account="" remote="" force=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account) account="$2"; shift 2 ;;
+      --remote) remote="$2"; shift 2 ;;
+      --force) force=true; shift ;;
+      *) die "unknown bind option: $1" ;;
+    esac
+  done
+  if [ -z "$account" ]; then
+    account="$(default_account)" || die "bind requires --account or a default account."
+  fi
+  load_account "$account"
+  [ -n "$remote" ] || remote="$ACCOUNT_DEFAULT_REMOTE"
+  [ -n "$remote" ] || die "bind requires --remote."
+  remote="${remote%/}"
+  validate_remote_root "$remote"
+  [ ! -f "$CONFIG_FILE" ] || [ "$force" = "true" ] || die "$CONFIG_FILE already exists. Use --force to overwrite."
+  cat > "$CONFIG_FILE" <<EOF
+ACCOUNT="$ACCOUNT_NAME"
+REMOTE_ROOT="$remote"
+EOF
+  mkdir -p "$HISTORY_DIR"
+  info "Bound $(pwd) to $ACCOUNT_NAME:$remote"
+}
+
+cmd_doctor() {
+  load_project
+  info "Config: $CONFIG_PATH"
+  info "Local root: $PROJECT_ROOT"
+  info "Account: $ACCOUNT_NAME"
+  info "Target: $ACCOUNT_TARGET"
+  info "Port: $ACCOUNT_PORT"
+  info "Remote root: $REMOTE_ROOT"
+  info "Local ssh: $(command -v ssh || echo MISSING)"
+  info "Local rsync: $(command -v rsync || echo MISSING)"
+  ssh_capture "printf 'host=' && hostname && printf 'pwd=' && pwd && printf 'remote_root=' && { test -d $(shell_quote "$REMOTE_ROOT") && echo exists || echo missing; } && printf 'rsync=' && { command -v rsync || true; } && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true"
+}
+
+cmd_exec() {
+  load_project
+  local detach=false cwd="$REMOTE_ROOT" name="" allow_dangerous=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --detach) detach=true; shift ;;
+      --cwd) cwd="$(remote_join "$2")"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      --allow-dangerous) allow_dangerous=true; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "exec requires a command"
+  local cmd="$*"
+  if [ "$allow_dangerous" != "true" ]; then
+    dangerous_command_check "$cmd" || die "Dangerous remote command blocked. Re-run with --allow-dangerous after explicit approval."
+  fi
+  [ -n "$name" ] || name="exec-$(date +%Y%m%d-%H%M%S)"
+  name="$(printf '%s' "$name" | sed 's/[^A-Za-z0-9_.-]/-/g')"
+  local log="$REMOTE_ROOT/.autodl-remote/logs/$name.log"
+  info "log=$log"
+  if [ "$detach" = "true" ]; then
+    ssh_capture "mkdir -p $(shell_quote "$(dirname "$log")") && cd $(shell_quote "$cwd") && nohup bash -lc $(shell_quote "$cmd") > $(shell_quote "$log") 2>&1 < /dev/null & printf 'pid=%s\nlog=%s\n' \"\$!\" $(shell_quote "$log")"
+    write_history exec-detach "$cmd log=$log"
+  else
+    local inner rc
+    inner="set -o pipefail; ( $cmd ) 2>&1 | tee $(shell_quote "$log"); exit \${PIPESTATUS[0]}"
+    ssh_run "mkdir -p $(shell_quote "$(dirname "$log")") && cd $(shell_quote "$cwd") && bash -lc $(shell_quote "$inner")"
+    rc=$?
+    write_history exec "$cmd rc=$rc log=$log"
+    return "$rc"
+  fi
+}
+
+cmd_put() {
+  load_project
+  local dry_run=false delete=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=true; shift ;;
+      --delete) delete=true; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [ $# -ge 1 ] || die "put requires <local-path> [remote-path]"
+  local local_arg="$1" remote_arg="${2:-}" local_path remote_path
+  local_path="$(local_join "$local_arg")"
+  [ -e "$local_path" ] || die "Local path does not exist: $local_arg"
+  if [ -z "$remote_arg" ]; then
+    remote_arg="$(remote_rel_for_local "$local_path")"
+  fi
+  remote_path="$(remote_join "$remote_arg")"
+  ensure_remote_dir "$(dirname "$remote_path")"
+  if command -v rsync >/dev/null 2>&1 && remote_has_rsync; then
+    local args=(-az --human-readable -e "$(rsync_ssh_command)")
+    [ "$dry_run" = "true" ] && args+=(--dry-run)
+    [ "$delete" = "true" ] && args+=(--delete)
+    if [ -d "$local_path" ]; then
+      run_transport rsync "${args[@]}" "$local_path/" "$ACCOUNT_TARGET:$remote_path/"
+    else
+      run_transport rsync "${args[@]}" "$local_path" "$ACCOUNT_TARGET:$remote_path"
+    fi
+  else
+    [ "$dry_run" != "true" ] || die "dry-run requires rsync."
+    ssh_common_args
+    local scp_args=(-P "$ACCOUNT_PORT")
+    [ -n "$ACCOUNT_KEY" ] && scp_args+=(-i "$ACCOUNT_KEY")
+    if [ -d "$local_path" ]; then
+      run_transport scp -r "${scp_args[@]}" "$local_path" "$ACCOUNT_TARGET:$remote_path"
+    else
+      run_transport scp "${scp_args[@]}" "$local_path" "$ACCOUNT_TARGET:$remote_path"
+    fi
+  fi
+  write_history put "$local_arg -> $remote_path"
+}
+
+cmd_get() {
+  load_project
+  local dry_run=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=true; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [ $# -ge 1 ] || die "get requires <remote-path> [local-path]"
+  local remote_arg="$1" local_arg="${2:-}" remote_path local_path kind
+  remote_path="$(remote_join "$remote_arg")"
+  if [ -z "$local_arg" ]; then
+    case "$remote_arg" in
+      /*) local_arg="$(basename "$remote_arg")" ;;
+      *) local_arg="$remote_arg" ;;
+    esac
+  fi
+  local_path="$(local_join "$local_arg")"
+  mkdir -p "$(dirname "$local_path")"
+  kind="$(ssh_capture "if [ -d $(shell_quote "$remote_path") ]; then echo dir; elif [ -f $(shell_quote "$remote_path") ]; then echo file; else echo missing; fi")"
+  [ "$kind" != "missing" ] || die "Remote path does not exist: $remote_arg"
+  if command -v rsync >/dev/null 2>&1 && remote_has_rsync; then
+    local args=(-az --human-readable -e "$(rsync_ssh_command)")
+    [ "$dry_run" = "true" ] && args+=(--dry-run)
+    if [ "$kind" = "dir" ]; then
+      mkdir -p "$local_path"
+      run_transport rsync "${args[@]}" "$ACCOUNT_TARGET:$remote_path/" "$local_path/"
+    else
+      run_transport rsync "${args[@]}" "$ACCOUNT_TARGET:$remote_path" "$local_path"
+    fi
+  else
+    [ "$dry_run" != "true" ] || die "dry-run requires rsync."
+    local scp_args=(-P "$ACCOUNT_PORT")
+    [ -n "$ACCOUNT_KEY" ] && scp_args+=(-i "$ACCOUNT_KEY")
+    if [ "$kind" = "dir" ]; then
+      run_transport scp -r "${scp_args[@]}" "$ACCOUNT_TARGET:$remote_path" "$local_path"
+    else
+      run_transport scp "${scp_args[@]}" "$ACCOUNT_TARGET:$remote_path" "$local_path"
+    fi
+  fi
+  write_history get "$remote_path -> $local_arg"
+}
+
+cmd_tree() {
+  load_project
+  local path="." depth=3 limit=500
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --depth) depth="$2"; shift 2 ;;
+      --limit) limit="$2"; shift 2 ;;
+      --) shift; break ;;
+      -*) die "unknown tree option: $1" ;;
+      *) path="$1"; shift ;;
+    esac
+  done
+  local remote_path
+  remote_path="$(remote_join "$path")"
+  ssh_capture "cd $(shell_quote "$remote_path") && { find . -maxdepth $depth | sed 's#^./##' | sort | head -n $limit; true; }"
+}
+
+cmd_ls() {
+  load_project
+  [ "${1:-}" = "--" ] && shift
+  local path="${1:-.}"
+  ssh_run "ls -lah $(shell_quote "$(remote_join "$path")")"
+}
+
+cmd_cat() {
+  load_project
+  local lines=200
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --lines) lines="$2"; shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "cat requires a path"
+  ssh_run "sed -n '1,${lines}p' $(shell_quote "$(remote_join "$1")")"
+}
+
+cmd_tail() {
+  load_project
+  local lines=120 follow=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --lines) lines="$2"; shift 2 ;;
+      --follow|-f) follow=true; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "tail requires a path"
+  local flag=""
+  [ "$follow" = "true" ] && flag="-f"
+  ssh_run "tail -n $lines $flag $(shell_quote "$(remote_join "$1")")"
+}
+
+cmd_shell() {
+  load_project
+  ssh_common_args
+  run_transport ssh -t "${SSH_ARGS[@]}" "$ACCOUNT_TARGET" "cd $(shell_quote "$REMOTE_ROOT") && exec bash -l"
+}
+
+cmd_history() {
+  load_project
+  local lines=20 file
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --lines) lines="$2"; shift 2 ;;
+      *) die "unknown history option: $1" ;;
+    esac
+  done
+  file="$PROJECT_ROOT/$HISTORY_DIR/history.jsonl"
+  [ -f "$file" ] || { info "No history yet."; return 0; }
+  tail -n "$lines" "$file"
+}
+
+main() {
+  [ $# -gt 0 ] || { usage; exit 0; }
+  local cmd="$1"
+  shift
+  case "$cmd" in
+    -h|--help|help) usage ;;
+    account) cmd_account "$@" ;;
+    bind) cmd_bind "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    exec) cmd_exec "$@" ;;
+    put|sync-up) cmd_put "$@" ;;
+    get|sync-down) cmd_get "$@" ;;
+    tree) cmd_tree "$@" ;;
+    ls) cmd_ls "$@" ;;
+    cat) cmd_cat "$@" ;;
+    tail) cmd_tail "$@" ;;
+    shell) cmd_shell "$@" ;;
+    history) cmd_history "$@" ;;
+    *) die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

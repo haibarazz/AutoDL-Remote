@@ -1,0 +1,68 @@
+<svg width="1280" height="500" viewBox="0 0 1280 500" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1280" y2="500" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F1F5F9"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#0F172A" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto">
+      <path d="M2 2L10 6L2 10V2Z" fill="#334155"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="500" rx="34" fill="url(#bg)"/>
+  <text x="640" y="70" text-anchor="middle" fill="#0F172A" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="34" font-weight="800">一次典型远端开发循环</text>
+  <text x="640" y="104" text-anchor="middle" fill="#64748B" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="19">先看清远端，再本地改代码，按需上传，远端运行，最后只取需要的结果</text>
+
+  <path d="M206 250H1074" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round"/>
+
+  <g filter="url(#shadow)">
+    <rect x="80" y="160" width="180" height="180" rx="22" fill="#EFF6FF" stroke="#93C5FD" stroke-width="2"/>
+    <circle cx="170" cy="208" r="30" fill="#2563EB"/>
+    <text x="170" y="218" text-anchor="middle" fill="#FFFFFF" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="28" font-weight="800">1</text>
+    <text x="170" y="270" text-anchor="middle" fill="#1E3A8A" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="800">查看远端</text>
+    <text x="170" y="300" text-anchor="middle" fill="#2563EB" font-family="SFMono-Regular,Consolas,monospace" font-size="15">tree / cat</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="320" y="160" width="180" height="180" rx="22" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="2"/>
+    <circle cx="410" cy="208" r="30" fill="#475569"/>
+    <text x="410" y="218" text-anchor="middle" fill="#FFFFFF" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="28" font-weight="800">2</text>
+    <text x="410" y="270" text-anchor="middle" fill="#0F172A" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="800">本地修改</text>
+    <text x="410" y="300" text-anchor="middle" fill="#475569" font-family="SFMono-Regular,Consolas,monospace" font-size="15">edit + git diff</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="560" y="160" width="180" height="180" rx="22" fill="#FEF3C7" stroke="#FBBF24" stroke-width="2"/>
+    <circle cx="650" cy="208" r="30" fill="#D97706"/>
+    <text x="650" y="218" text-anchor="middle" fill="#FFFFFF" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="28" font-weight="800">3</text>
+    <text x="650" y="270" text-anchor="middle" fill="#78350F" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="800">按需上传</text>
+    <text x="650" y="300" text-anchor="middle" fill="#B45309" font-family="SFMono-Regular,Consolas,monospace" font-size="15">put / sync-up</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="800" y="160" width="180" height="180" rx="22" fill="#ECFDF5" stroke="#86EFAC" stroke-width="2"/>
+    <circle cx="890" cy="208" r="30" fill="#16A34A"/>
+    <text x="890" y="218" text-anchor="middle" fill="#FFFFFF" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="28" font-weight="800">4</text>
+    <text x="890" y="270" text-anchor="middle" fill="#14532D" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="800">远端运行</text>
+    <text x="890" y="300" text-anchor="middle" fill="#15803D" font-family="SFMono-Regular,Consolas,monospace" font-size="15">exec --detach</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1040" y="160" width="180" height="180" rx="22" fill="#F5F3FF" stroke="#C4B5FD" stroke-width="2"/>
+    <circle cx="1130" cy="208" r="30" fill="#7C3AED"/>
+    <text x="1130" y="218" text-anchor="middle" fill="#FFFFFF" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="28" font-weight="800">5</text>
+    <text x="1130" y="270" text-anchor="middle" fill="#4C1D95" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="800">查看结果</text>
+    <text x="1130" y="300" text-anchor="middle" fill="#6D28D9" font-family="SFMono-Regular,Consolas,monospace" font-size="15">tail / get</text>
+  </g>
+
+  <path d="M260 250H315" stroke="#334155" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M500 250H555" stroke="#334155" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M740 250H795" stroke="#334155" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M980 250H1035" stroke="#334155" stroke-width="4" marker-end="url(#arrow)"/>
+
+  <rect x="312" y="393" width="656" height="42" rx="21" fill="#FFFFFF" stroke="#CBD5E1"/>
+  <text x="640" y="420" text-anchor="middle" fill="#334155" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="17">每一步都是显式命令，适合让 Codex 根据当前任务自主组合</text>
+</svg>
