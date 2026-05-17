@@ -17,6 +17,9 @@ Use this skill when the user wants Codex to work locally while controlling AutoD
 - Prefer reading remote files/logs in place with `cat`, `tail`, `ls`, and `tree`.
 - Use detached job commands for long training runs instead of manually guessing process state.
 - Use `shutdown` when the user asks to stop the remote machine; treat SSH disconnect during shutdown as likely success.
+- Before using AutoDL Remote in a project, read `.autodl-remote/CONVENTIONS.md` if it exists. Treat it as the project-specific source for runtime, paths, sync rules, and notes.
+- When the user and Codex discuss or decide any project-specific remote configuration, runtime environment, path convention, model/data/output location, sync preference, or safety rule, update `.autodl-remote/CONVENTIONS.md` so future sessions can reuse it.
+- Keep `.autodl-remote/CONVENTIONS.md` concise and project-specific; do not turn it into a generic manual.
 
 ## Setup
 
@@ -73,6 +76,6 @@ autodl-remote shutdown
 - Prefer `job status <name>` and `job tail <name>` for detached jobs created with `--name`.
 - Prefer `exec --script` or `exec --stdin` for complex multi-line commands, Python heredocs, env vars, JSON, awk, or sed.
 - Use `put-run` when the workflow is "upload these local paths, then immediately run this remote command".
-- `model-dir` prints the project model directory convention. The first project command creates `.autodl-remote/CONVENTIONS.md` locally for project notes.
+- `model-dir` prints the project model directory convention. The first project command creates `.autodl-remote/CONVENTIONS.md` locally for concise project notes.
 - `shutdown` first syncs the remote filesystem, then tries provider-safe shutdown methods, waits, and verifies that SSH disconnects.
 - Treat broad destructive commands as dangerous; require explicit user approval before using `--allow-dangerous`.

@@ -175,17 +175,30 @@ ensure_project_conventions() {
   cat > "$file" <<EOF
 # AutoDL Remote Conventions
 
-This file is created locally by \`autodl-remote\` to record project-level remote workflow notes.
+This file is created locally by \`autodl-remote\` to record project-specific remote workflow conventions.
 
-- Account: \`$ACCOUNT_NAME\`
+## Runtime
+
+- Activate command: \`<fill me, e.g. conda activate env or source .venv/bin/activate>\`
+- Python command: \`python\`
+- Install packages: ask before installing
+
+## Remote Paths
+
 - Remote root: \`$REMOTE_ROOT\`
-- Model directory: \`$PROJECT_MODEL_DIR\`
-- Large files such as models, datasets, checkpoints, and training outputs should stay remote unless explicitly pulled.
-- Edit code locally, upload selected files with \`put\` or \`sync-up\`, run on the remote GPU, then inspect logs/results remotely first.
+- Model dir: \`$PROJECT_MODEL_DIR\`
+- Data dir: \`<fill me>\`
+- Output dir: \`<fill me>\`
 
-## Project Notes
+## Sync Rules
 
-- Add project-specific paths, model locations, dataset locations, and run commands here.
+- Edit code locally first, then upload selected files.
+- Do not download models, datasets, checkpoints, or large outputs unless explicitly asked.
+- Prefer remote \`cat\`, \`tail\`, \`ls\`, and \`tree\` before downloading files.
+
+## Notes
+
+- Add project-specific notes here.
 EOF
 }
 
