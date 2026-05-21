@@ -22,7 +22,9 @@ Use this skill when the user wants Codex to work locally while controlling AutoD
 - Use detached job commands for long training runs instead of manually guessing process state.
 - Use run metadata (`--model`, `--tag`, `--stage`, `--purpose`) when launching experiments so `run list` and the dashboard explain what is running.
 - Use `fleet` for multi-device projects and `dashboard` for display-only visibility. The dashboard must not be treated as an operation surface.
-- When the user wants to watch progress, run `autodl-remote dashboard --watch <seconds> --lines <n> --open` instead of copying logs into chat.
+- Do not start or open the dashboard by default. For single-device work, prefer `run status`, `run tail`, `job status`, or `tail` unless the user explicitly asks for a dashboard or live visual monitoring.
+- For multi-device work, the dashboard is appropriate only when the user asks for a dashboard, overview, or live monitoring; otherwise keep the workflow in CLI commands.
+- When the user wants to watch progress visually, run `autodl-remote dashboard --watch <seconds> --lines <n> --open` instead of copying logs into chat.
 - Use `shutdown` when the user asks to stop the remote machine; treat SSH disconnect during shutdown as likely success.
 - Before using AutoDL Remote in a project, read `.autodl-remote/CONVENTIONS.md` if it exists. Treat it as the project-specific source for runtime, paths, sync rules, and notes.
 - When the user and Codex discuss or decide any project-specific remote configuration, runtime environment, path convention, model/data/output location, sync preference, or safety rule, update `.autodl-remote/CONVENTIONS.md` so future sessions can reuse it.
@@ -92,7 +94,7 @@ autodl-remote shutdown
 - Use `exec --detach` for long training jobs and then `tail` the log path.
 - Prefer `job status <name>` and `job tail <name>` for detached jobs created with `--name`.
 - Prefer `run list`, `run status`, `run tail`, and `run note` when the user is thinking in terms of experiments/models rather than raw jobs.
-- For multiple machines, use `fleet add/list/status` and `dashboard --fleet <name>` instead of manually tracking devices in chat.
+- For multiple machines, use `fleet add/list/status` by default. Use `dashboard --fleet <name>` only after the user asks for a dashboard, overview, or live monitoring.
 - When inspecting a non-default fleet device, pass `--account` and `--remote` to `tree`, `ls`, `cat`, `tail`, `put`, `get`, and `exec` instead of rebinding the project.
 - The dashboard is read-only and can be used for one device or many devices. Do not add operational assumptions just because the dashboard exists.
 - Dashboard logs are pulled from remote run log files. Add useful stdout logging to scripts instead of expecting Codex to summarize progress in chat.
