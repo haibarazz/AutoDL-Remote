@@ -39,6 +39,7 @@
 | ⬇️ 显式下载 | 用 `get` 或 `sync-down` 只拉回需要查看或提交的结果 |
 | 📜 日志查看 | 用 `tail` 查看远端训练日志，不必下载大文件 |
 | 🧾 Job 状态 | 用 `job status` 和 `job tail` 跟踪 `exec --detach --name` 创建的长任务 |
+| 📊 Dashboard | 用只读页面查看多台远端设备、run 状态和最近日志，减少聊天里反复粘贴日志 |
 | 🧠 脚本执行 | 用 `exec --script` 或 `exec --stdin` 避免复杂 quoting |
 | ⏻ 远端关机 | 用 `shutdown` 处理 AutoDL 关机和 SSH 断开返回码 |
 | 📝 项目约定 | 首次使用自动生成 `.autodl-remote/CONVENTIONS.md` 记录远端约定 |
@@ -223,6 +224,20 @@ autodl-remote exec -- nvidia-smi
 
 &emsp;&emsp;这个边界很重要：**本地负责代码和修改痕迹，远端负责大模型、数据集、checkpoint 和 GPU 任务。** 插件不会默认下载模型权重，也不会默认把整个远端目录同步回来。
 
+## 📊 Dashboard
+
+<div align="center">
+  <img src="./docs/images/autodl-remote-dashboard.png" alt="AutoDL Remote Dashboard 示例" width="100%">
+</div>
+
+&emsp;&emsp;Dashboard 是只读的本地页面：它通过 SSH 轮询远端状态，显示设备在线情况、GPU/磁盘信息、当前 run，以及远端日志的最近若干行。Codex 只需要启动 dashboard 命令，不需要把训练日志复制到聊天里。
+
+```bash
+autodl-remote dashboard --fleet llm-exp --open --watch 5 --lines 120
+```
+
+&emsp;&emsp;为了让 dashboard 更有用，运行脚本建议输出结构化日志，例如 `[START]`、`[ENV]`、`[PROGRESS]`、`[METRIC]`、`[OUTPUT]`、`[DONE]`。Python 任务建议使用 `PYTHONUNBUFFERED=1 python -u ...`，这样日志能更快出现在页面里。
+
 ## 🛠️ Commands
 
 | 命令 | 用途 |
@@ -243,6 +258,8 @@ autodl-remote exec -- nvidia-smi
 | `autodl-remote job list` | 列出本地记录的远端长任务 |
 | `autodl-remote job status train` | 查看长任务 PID、日志、远端状态和退出码 |
 | `autodl-remote job tail train` | 查看命名长任务日志 |
+| `autodl-remote fleet status exp` | 查看多台远端设备状态 |
+| `autodl-remote dashboard --fleet exp --watch 5 --lines 120` | 打开只读 dashboard，持续展示远端状态和日志 |
 | `autodl-remote model-dir --mkdir` | 输出并创建项目模型目录 |
 | `autodl-remote shutdown` | 请求远端关机，并把 SSH 断开视为可能成功 |
 

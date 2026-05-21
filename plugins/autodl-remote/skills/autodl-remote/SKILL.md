@@ -10,16 +10,24 @@ Use this skill when the user wants Codex to work locally while controlling AutoD
 ## Operating Model
 
 - The plugin is a thin SSH tool layer.
+- For AutoDL or remote SSH work, first verify the tool with `autodl-remote --version`, then use `autodl-remote` as the default gateway for remote commands and file transfer.
+- Do not hand-write raw `ssh`, `expect`, `scp`, or `rsync` workflows for AutoDL work unless `autodl-remote` is unavailable, the command fails after a reasonable retry, or the user explicitly asks to bypass the plugin.
+- If bypassing `autodl-remote`, state the concrete reason before doing so and avoid printing passwords or embedding credentials in shell history/logs.
+- For complex remote checks or multi-line scripts, use `autodl-remote exec --script` or `autodl-remote exec --stdin -- bash`; do not pack nested Python heredocs or long quoted scripts into a raw SSH command.
 - Do not decide that local or remote is the source of truth globally.
 - Do not use `local-main`, `remote-main`, manifests, sparse-cache modes, or automatic code ownership rules.
 - Codex decides the smallest useful action each time: inspect, upload, download, run, or tail logs.
 - Do not download LLM weights, checkpoints, datasets, or large outputs unless the user explicitly asks.
 - Prefer reading remote files/logs in place with `cat`, `tail`, `ls`, and `tree`.
 - Use detached job commands for long training runs instead of manually guessing process state.
+- Use run metadata (`--model`, `--tag`, `--stage`, `--purpose`) when launching experiments so `run list` and the dashboard explain what is running.
+- Use `fleet` for multi-device projects and `dashboard` for display-only visibility. The dashboard must not be treated as an operation surface.
+- When the user wants to watch progress, run `autodl-remote dashboard --watch <seconds> --lines <n> --open` instead of copying logs into chat.
 - Use `shutdown` when the user asks to stop the remote machine; treat SSH disconnect during shutdown as likely success.
 - Before using AutoDL Remote in a project, read `.autodl-remote/CONVENTIONS.md` if it exists. Treat it as the project-specific source for runtime, paths, sync rules, and notes.
 - When the user and Codex discuss or decide any project-specific remote configuration, runtime environment, path convention, model/data/output location, sync preference, or safety rule, update `.autodl-remote/CONVENTIONS.md` so future sessions can reuse it.
 - Keep `.autodl-remote/CONVENTIONS.md` concise and project-specific; do not turn it into a generic manual.
+- When writing remote run scripts, emit clear stdout logs because dashboard content comes from the remote log, not from Codex narration. Prefer markers such as `[START]`, `[ENV]`, `[PROGRESS]`, `[METRIC]`, `[OUTPUT]`, `[DONE]`, and `[ERROR]`. For Python, prefer `PYTHONUNBUFFERED=1 python -u ...`.
 
 ## Setup
 
@@ -57,12 +65,21 @@ autodl-remote sync-down logs/train.log ./logs/train.log
 
 autodl-remote exec -- pwd
 autodl-remote exec -- python train.py
-autodl-remote exec --detach --name train -- python train.py
+autodl-remote exec --detach --name train --model baseline --stage training -- python train.py
 autodl-remote exec --script scripts/remote_check.sh
 cat scripts/remote_check.sh | autodl-remote exec --stdin -- bash
 autodl-remote job list
 autodl-remote job status train
 autodl-remote job tail train
+autodl-remote run list
+autodl-remote run note train --stage evaluating
+autodl-remote fleet create rag-exp
+autodl-remote fleet add rag-exp nmb1 --account autodl-nmb1 --remote /root/autodl-tmp/LLM-RAG --tags a800,rag
+autodl-remote fleet status rag-exp
+autodl-remote tree --account autodl-nmb1 --remote /root/autodl-tmp/LLM-RAG . --depth 2
+autodl-remote dashboard
+autodl-remote dashboard --fleet rag-exp --open
+autodl-remote dashboard --fleet rag-exp --open --watch 5 --lines 120
 autodl-remote shutdown
 ```
 
@@ -74,6 +91,11 @@ autodl-remote shutdown
 - If both local and remote have similar files, do not assume one should overwrite the other. Compare or inspect first, then choose `put` or `get`.
 - Use `exec --detach` for long training jobs and then `tail` the log path.
 - Prefer `job status <name>` and `job tail <name>` for detached jobs created with `--name`.
+- Prefer `run list`, `run status`, `run tail`, and `run note` when the user is thinking in terms of experiments/models rather than raw jobs.
+- For multiple machines, use `fleet add/list/status` and `dashboard --fleet <name>` instead of manually tracking devices in chat.
+- When inspecting a non-default fleet device, pass `--account` and `--remote` to `tree`, `ls`, `cat`, `tail`, `put`, `get`, and `exec` instead of rebinding the project.
+- The dashboard is read-only and can be used for one device or many devices. Do not add operational assumptions just because the dashboard exists.
+- Dashboard logs are pulled from remote run log files. Add useful stdout logging to scripts instead of expecting Codex to summarize progress in chat.
 - Prefer `exec --script` or `exec --stdin` for complex multi-line commands, Python heredocs, env vars, JSON, awk, or sed.
 - Use `put-run` when the workflow is "upload these local paths, then immediately run this remote command".
 - `model-dir` prints the project model directory convention. The first project command creates `.autodl-remote/CONVENTIONS.md` locally for concise project notes.

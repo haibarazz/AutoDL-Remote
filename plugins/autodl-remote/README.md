@@ -37,6 +37,12 @@ Passwords are never written to project files.
 
 ## Quick Start
 
+Check the installed CLI version:
+
+```bash
+autodl-remote --version
+```
+
 Create or choose an account:
 
 ```bash
@@ -64,9 +70,10 @@ autodl-remote model-dir
 autodl-remote tree . --depth 2
 autodl-remote exec -- pwd
 autodl-remote exec -- python train.py
-autodl-remote exec --detach --name train -- python train.py
-autodl-remote job status train
-autodl-remote job tail train
+autodl-remote exec --detach --name train --model baseline --stage training -- python train.py
+autodl-remote run status train
+autodl-remote run tail train
+autodl-remote dashboard
 ```
 
 Move files only when needed:
@@ -90,6 +97,60 @@ Shutdown the remote machine after a run:
 
 ```bash
 autodl-remote shutdown
+```
+
+## Fleet and Dashboard
+
+The dashboard is read-only. It shows local run metadata, lightweight remote status from SSH polling, and the latest remote log lines for recorded runs. It does not stop jobs, delete files, upload, download, or shut down machines.
+
+![AutoDL Remote Dashboard](../../docs/images/autodl-remote-dashboard.png)
+
+Single-machine dashboard for the current project binding:
+
+```bash
+autodl-remote dashboard
+autodl-remote dashboard --open
+autodl-remote dashboard --open --watch 5 --lines 120
+```
+
+Create a project-local fleet:
+
+```bash
+autodl-remote fleet create rag-exp
+autodl-remote fleet add rag-exp nmb1 --account autodl-nmb1 --remote /root/autodl-tmp/LLM-RAG --tags a800,rag
+autodl-remote fleet add rag-exp cqa1 --account autodl-cqa1 --remote /root/autodl-tmp/LLM-RAG --tags 4090,rag
+autodl-remote fleet status rag-exp
+autodl-remote dashboard --fleet rag-exp --open
+autodl-remote dashboard --fleet rag-exp --open --watch 5 --lines 120
+```
+
+Run metadata lets the dashboard show what Codex intended to run:
+
+```bash
+autodl-remote exec --account autodl-nmb1 --remote /root/autodl-tmp/LLM-RAG \
+  --detach --name melu-fold3 --model MeLU --stage training --tag fold=3 \
+  --purpose "no-leak 5-fold experiment" -- python train.py model=melu fold=3
+
+autodl-remote run list
+autodl-remote run note melu-fold3 --stage predicting --output outputs/melu_fold3.csv
+```
+
+For long-running Python jobs, prefer unbuffered logs so the dashboard updates quickly:
+
+```bash
+PYTHONUNBUFFERED=1 python -u train.py
+```
+
+Useful log markers:
+
+```text
+[START] model=... device=... cwd=...
+[ENV] python=... cuda=...
+[PROGRESS] epoch=... step=... loss=...
+[METRIC] val_auc=...
+[OUTPUT] path=...
+[DONE] exit_code=0
+[ERROR] ...
 ```
 
 ## Accounts
@@ -146,20 +207,30 @@ autodl-remote account password-delete <name>
 autodl-remote bind [--account name] --remote /remote/project/root
 autodl-remote doctor
 autodl-remote model-dir [--mkdir]
+autodl-remote fleet create <name>
+autodl-remote fleet add <fleet> <device> [--account name] [--remote path] [--tags tags]
+autodl-remote fleet list
+autodl-remote fleet status [fleet]
+autodl-remote dashboard [--fleet name] [--output path] [--open] [--watch seconds] [--lines 120]
 
-autodl-remote exec [--detach] [--cwd path] [--name name] [--script local_script] [--stdin] -- <command>
+autodl-remote exec [--account name] [--remote path] [--detach] [--cwd path] [--name name] [--model name] [--tag k=v] [--stage stage] [--purpose text] [--script local_script] [--stdin] -- <command>
 autodl-remote put-run <local-path>... -- <command>
-autodl-remote put <local-path> [remote-path]
-autodl-remote get <remote-path> [local-path]
-autodl-remote sync-up <local-path> [remote-path]
-autodl-remote sync-down <remote-path> [local-path]
-autodl-remote tree [remote-path] [--depth 3] [--limit 500]
-autodl-remote ls [remote-path]
-autodl-remote cat [--lines 200] -- <remote-path>
-autodl-remote tail [--lines 120] [--follow] -- <remote-path>
+autodl-remote put [--account name] [--remote path] <local-path> [remote-path]
+autodl-remote get [--account name] [--remote path] <remote-path> [local-path]
+autodl-remote sync-up [--account name] [--remote path] <local-path> [remote-path]
+autodl-remote sync-down [--account name] [--remote path] <remote-path> [local-path]
+autodl-remote tree [--account name] [--remote path] [remote-path] [--depth 3] [--limit 500]
+autodl-remote ls [--account name] [--remote path] [remote-path]
+autodl-remote cat [--account name] [--remote path] [--lines 200] -- <remote-path>
+autodl-remote tail [--account name] [--remote path] [--lines 120] [--follow] -- <remote-path>
 autodl-remote job list
 autodl-remote job status <name>
 autodl-remote job tail [--lines 120] [--follow] <name>
+autodl-remote run submit [metadata/options] -- <command>
+autodl-remote run list
+autodl-remote run status <name>
+autodl-remote run tail [--lines 120] [--follow] <name>
+autodl-remote run note <name> [--model name] [--tag k=v] [--stage stage] [--purpose text] [--output path]
 autodl-remote shutdown [--wait seconds]
 autodl-remote shell
 autodl-remote history
@@ -176,4 +247,7 @@ autodl-remote history
 - Keep large models, datasets, checkpoints, and training outputs on AutoDL unless the user explicitly pulls them.
 - Use `exec --script` or `exec --stdin` for multi-line shell/Python snippets.
 - Use `job status` and `job tail` for detached training jobs created with `exec --detach --name`.
+- Use `fleet` and `dashboard` for multi-device visibility; the dashboard is display-only.
+- Use `dashboard --watch <seconds> --lines <n>` when the user wants to watch remote logs without spending chat tokens.
+- Use run metadata flags (`--model`, `--tag`, `--stage`, `--purpose`) when Codex launches experiments so later dashboards are understandable.
 - Use `shutdown` instead of guessing provider-specific poweroff commands.

@@ -2,6 +2,7 @@
 set -u
 
 PROGRAM="autodl-remote"
+PROGRAM_VERSION="0.7.0"
 APP_DIR="$HOME/.autodl-remote"
 ACCOUNTS_DIR="$APP_DIR/accounts"
 DEFAULT_ACCOUNT_FILE="$APP_DIR/default-account"
@@ -22,6 +23,10 @@ usage() {
   cat <<'EOF'
 usage: autodl-remote <command> [options]
 
+general:
+  --version
+  version
+
 account:
   account add <name> [--target root@host | --host host --user root] [--port 22] [--key path] [--auth prompt|keychain|ssh-key] [--default-remote path]
   account list
@@ -35,26 +40,40 @@ project:
   bind [--account name] --remote /remote/project/root
   doctor
   model-dir [--mkdir]
+  fleet create <name>
+  fleet add <fleet> <device> [--account name] [--remote path] [--tags tags]
+  fleet list
+  fleet status [fleet]
+  dashboard [--fleet name] [--output path] [--open] [--watch seconds] [--lines 120]
 
 remote:
-  exec [--detach] [--cwd path] [--name name] [--script local_script] [--stdin] [--allow-dangerous] -- <command>
+  exec [--account name] [--remote path] [--detach] [--cwd path] [--name name] [--model name] [--tag k=v] [--stage stage] [--purpose text] [--script local_script] [--stdin] [--allow-dangerous] -- <command>
   put-run <local-path>... -- <command>
-  put <local-path> [remote-path]
-  get <remote-path> [local-path]
-  sync-up <local-path> [remote-path]
-  sync-down <remote-path> [local-path]
-  tree [remote-path] [--depth 3] [--limit 500]
-  ls [remote-path]
-  cat [--lines 200] -- <remote-path>
-  tail [--lines 120] [--follow] -- <remote-path>
+  put [--account name] [--remote path] <local-path> [remote-path]
+  get [--account name] [--remote path] <remote-path> [local-path]
+  sync-up [--account name] [--remote path] <local-path> [remote-path]
+  sync-down [--account name] [--remote path] <remote-path> [local-path]
+  tree [--account name] [--remote path] [remote-path] [--depth 3] [--limit 500]
+  ls [--account name] [--remote path] [remote-path]
+  cat [--account name] [--remote path] [--lines 200] -- <remote-path>
+  tail [--account name] [--remote path] [--lines 120] [--follow] -- <remote-path>
   job list
   job status <name>
   job tail [--lines 120] [--follow] <name>
+  run submit [metadata/options] -- <command>
+  run list
+  run status <name>
+  run tail [--lines 120] [--follow] <name>
+  run note <name> [--model name] [--tag k=v] [--stage stage] [--purpose text] [--output path]
   shutdown [--wait seconds]
   shell
   history [--lines 20]
 
 EOF
+}
+
+cmd_version() {
+  printf '%s %s\n' "$PROGRAM" "$PROGRAM_VERSION"
 }
 
 shell_quote() {
@@ -80,11 +99,26 @@ $1
 EOF
 }
 
+html_escape() {
+  sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g' <<EOF
+$1
+EOF
+}
+
 valid_name() {
   case "$1" in
     ""|*/*|*..*|*[\ \	]*) return 1 ;;
   esac
   return 0
+}
+
+append_csv() {
+  local current="$1" value="$2"
+  if [ -n "$current" ]; then
+    printf '%s,%s\n' "$current" "$value"
+  else
+    printf '%s\n' "$value"
+  fi
 }
 
 ensure_app_dirs() {
@@ -213,23 +247,134 @@ job_path() {
 }
 
 write_job() {
-  local name="$1" pid="$2" log="$3" status_path="$4" cwd="$5" command="$6" file
+  local name="$1" pid="$2" log="$3" status_path="$4" cwd="$5" command="$6" model="${7:-}" tags="${8:-}" purpose="${9:-}" stage="${10:-}" outputs="${11:-}" file
   mkdir -p "$(jobs_dir)"
   file="$(job_path "$name")"
   cat > "$file" <<EOF
 NAME="$(config_quote "$name")"
 PID="$(config_quote "$pid")"
+ACCOUNT="$(config_quote "$ACCOUNT_NAME")"
+REMOTE_ROOT="$(config_quote "$REMOTE_ROOT")"
 LOG_PATH="$(config_quote "$log")"
 STATUS_PATH="$(config_quote "$status_path")"
 CWD="$(config_quote "$cwd")"
 STARTED_AT="$(date +%Y-%m-%dT%H:%M:%S%z)"
 COMMAND="$(config_quote "$command")"
+MODEL="$(config_quote "$model")"
+TAGS="$(config_quote "$tags")"
+PURPOSE="$(config_quote "$purpose")"
+STAGE="$(config_quote "$stage")"
+OUTPUTS="$(config_quote "$outputs")"
 EOF
 }
 
 job_get() {
   local file="$1" key="$2"
   config_get_from "$file" "$key"
+}
+
+config_set_in_file() {
+  local file="$1" key="$2" value="$3" quoted tmp
+  quoted="$(config_quote "$value")"
+  tmp="$file.tmp"
+  awk -F= -v key="$key" -v quoted="$quoted" '
+    BEGIN { done=0 }
+    $1 == key {
+      if (!done) {
+        print key "=\"" quoted "\""
+        done=1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!done) print key "=\"" quoted "\""
+    }
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+apply_context_override() {
+  local account="${1:-}" remote="${2:-}"
+  if [ -n "$account" ]; then
+    load_account "$account"
+    PROJECT_ACCOUNT="$ACCOUNT_NAME"
+    if [ -z "$remote" ] && [ -n "$ACCOUNT_DEFAULT_REMOTE" ]; then
+      remote="$ACCOUNT_DEFAULT_REMOTE"
+    fi
+  fi
+  if [ -n "$remote" ]; then
+    REMOTE_ROOT="${remote%/}"
+    validate_remote_root "$REMOTE_ROOT"
+    PROJECT_MODEL_DIR="$(default_model_dir)"
+  fi
+}
+
+fleet_root() {
+  printf '%s/%s/fleets\n' "$PROJECT_ROOT" "$HISTORY_DIR"
+}
+
+fleet_dir() {
+  local name="$1"
+  valid_name "$name" || die "Invalid fleet name: $name"
+  printf '%s/%s\n' "$(fleet_root)" "$name"
+}
+
+fleet_device_path() {
+  local fleet="$1" device="$2"
+  valid_name "$device" || die "Invalid device name: $device"
+  printf '%s/%s.conf\n' "$(fleet_dir "$fleet")" "$device"
+}
+
+device_get() {
+  local file="$1" key="$2"
+  config_get_from "$file" "$key"
+}
+
+apply_job_context() {
+  local file="$1" account remote
+  account="$(job_get "$file" ACCOUNT)"
+  remote="$(job_get "$file" REMOTE_ROOT)"
+  [ -n "$account" ] || account="${PROJECT_BOUND_ACCOUNT:-$PROJECT_ACCOUNT}"
+  [ -n "$remote" ] || remote="${PROJECT_BOUND_REMOTE_ROOT:-$REMOTE_ROOT}"
+  apply_context_override "$account" "$remote"
+}
+
+job_remote_status_summary() {
+  local file="$1" pid status_path output rc status alive
+  apply_job_context "$file"
+  pid="$(job_get "$file" PID)"
+  status_path="$(job_get "$file" STATUS_PATH)"
+  output="$(ssh_capture "if [ -f $(shell_quote "$status_path") ]; then cat $(shell_quote "$status_path"); elif kill -0 $(shell_quote "$pid") 2>/dev/null; then printf 'status=running\npid=%s\n' $(shell_quote "$pid"); else printf 'status=unknown\npid=%s\n' $(shell_quote "$pid"); fi; if kill -0 $(shell_quote "$pid") 2>/dev/null; then echo alive=yes; else echo alive=no; fi" 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'unreachable\n'
+    return 0
+  fi
+  status="$(printf '%s\n' "$output" | awk -F= '$1=="status"{print $2; exit}')"
+  alive="$(printf '%s\n' "$output" | awk -F= '$1=="alive"{print $2; exit}')"
+  [ -n "$status" ] || status="unknown"
+  if [ "$alive" = "yes" ] && [ "$status" = "unknown" ]; then
+    status="running"
+  fi
+  printf '%s\n' "$status"
+}
+
+remote_probe() {
+  local output rc
+  output="$(ssh_capture "root=$(shell_quote "$REMOTE_ROOT"); printf 'online=yes\n'; printf 'host='; hostname 2>/dev/null || echo unknown; printf 'remote_root=%s\n' \"\$root\"; printf 'disk='; df -h \"\$root\" 2>/dev/null | awk 'NR==2{print \$3 \"/\" \$2 \" \" \$5}' || echo unknown; if command -v nvidia-smi >/dev/null 2>&1; then printf 'gpu='; nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -n 1 | awk -F, '{gsub(/^ +| +$/, \"\", \$1); gsub(/^ +| +$/, \"\", \$2); gsub(/^ +| +$/, \"\", \$3); gsub(/^ +| +$/, \"\", \$4); print \$1 \" \" \$2 \"/\" \$3 \" MiB \" \$4 \"%\"}'; else echo 'gpu=unavailable'; fi; printf 'processes='; pgrep -af 'python|torchrun|accelerate' 2>/dev/null | head -n 3 | tr '\n' '|' | sed 's/|$//'; printf '\n'" 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf '%s\n' "$output"
+  else
+    printf 'online=no\n'
+    printf 'error=%s\n' "$(printf '%s' "$output" | head -n 1)"
+  fi
+}
+
+kv_get() {
+  local data="$1" key="$2"
+  printf '%s\n' "$data" | awk -F= -v key="$key" '$1==key{print substr($0, length(key)+2); exit}'
 }
 
 load_account() {
@@ -293,12 +438,15 @@ load_project() {
   esac
   PROJECT_MODEL_DIR="${PROJECT_MODEL_DIR%/}"
   validate_remote_root "$PROJECT_MODEL_DIR"
+  PROJECT_BOUND_ACCOUNT="$PROJECT_ACCOUNT"
+  PROJECT_BOUND_REMOTE_ROOT="$REMOTE_ROOT"
   ensure_project_conventions
 }
 
 ssh_common_args() {
-  SSH_ARGS=(-p "$ACCOUNT_PORT" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPersist=600 -o "ControlPath=$APP_DIR/ssh-%C")
-  mkdir -p "$APP_DIR"
+  local control_path
+  control_path="$(ssh_control_path)"
+  SSH_ARGS=(-p "$ACCOUNT_PORT" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPersist=600 -o "ControlPath=$control_path")
   [ -n "$ACCOUNT_KEY" ] && SSH_ARGS+=(-i "$ACCOUNT_KEY")
   if [ "$ACCOUNT_AUTH" != "keychain" ] && [ "$ACCOUNT_AUTH" != "prompt" ]; then
     SSH_ARGS+=(-o BatchMode=yes)
@@ -306,8 +454,9 @@ ssh_common_args() {
 }
 
 scp_common_args() {
-  SCP_ARGS=(-P "$ACCOUNT_PORT" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPersist=600 -o "ControlPath=$APP_DIR/ssh-%C")
-  mkdir -p "$APP_DIR"
+  local control_path
+  control_path="$(ssh_control_path)"
+  SCP_ARGS=(-P "$ACCOUNT_PORT" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPersist=600 -o "ControlPath=$control_path")
   [ -n "$ACCOUNT_KEY" ] && SCP_ARGS+=(-i "$ACCOUNT_KEY")
   if [ "$ACCOUNT_AUTH" != "keychain" ] && [ "$ACCOUNT_AUTH" != "prompt" ]; then
     SCP_ARGS+=(-o BatchMode=yes)
@@ -315,13 +464,26 @@ scp_common_args() {
 }
 
 rsync_ssh_command() {
-  local cmd
-  cmd="ssh -p $(shell_quote "$ACCOUNT_PORT") -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPersist=600 -o ControlPath=$(shell_quote "$APP_DIR/ssh-%C")"
+  local cmd control_path
+  control_path="$(ssh_control_path)"
+  cmd="ssh -p $(shell_quote "$ACCOUNT_PORT") -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPersist=600 -o ControlPath=$(shell_quote "$control_path")"
   [ -n "$ACCOUNT_KEY" ] && cmd="$cmd -i $(shell_quote "$ACCOUNT_KEY")"
   if [ "$ACCOUNT_AUTH" != "keychain" ] && [ "$ACCOUNT_AUTH" != "prompt" ]; then
     cmd="$cmd -o BatchMode=yes"
   fi
   printf '%s\n' "$cmd"
+}
+
+ssh_control_dir() {
+  local base
+  base="${AUTODL_REMOTE_CONTROL_DIR:-/tmp/autodl-remote-${UID:-user}}"
+  mkdir -p "$base"
+  chmod 700 "$base" 2>/dev/null || true
+  printf '%s\n' "$base"
+}
+
+ssh_control_path() {
+  printf '%s/ssh-%%C\n' "$(ssh_control_dir)"
 }
 
 keychain_password() {
@@ -425,7 +587,7 @@ remote_has_rsync() {
 
 ensure_remote_dir() {
   local dir="$1"
-  ssh_capture "mkdir -p $(shell_quote "$dir")" >/dev/null
+  ssh_capture "mkdir -p $(shell_quote "$dir")" </dev/null >/dev/null
 }
 
 upload_local_file() {
@@ -779,12 +941,20 @@ cmd_doctor() {
 
 cmd_exec() {
   load_project
-  local detach=false cwd="$REMOTE_ROOT" name="" allow_dangerous=false script="" stdin_mode=false remote_script=""
+  local detach=false cwd="" cwd_arg="" name="" allow_dangerous=false script="" stdin_mode=false remote_script=""
+  local account_override="" remote_override="" model="" tags="" purpose="" stage="" outputs=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --account) account_override="$2"; shift 2 ;;
+      --remote) remote_override="$2"; shift 2 ;;
       --detach) detach=true; shift ;;
-      --cwd) cwd="$(remote_join "$2")"; shift 2 ;;
+      --cwd) cwd_arg="$2"; shift 2 ;;
       --name) name="$2"; shift 2 ;;
+      --model) model="$2"; shift 2 ;;
+      --tag) tags="$(append_csv "$tags" "$2")"; shift 2 ;;
+      --purpose) purpose="$2"; shift 2 ;;
+      --stage) stage="$2"; shift 2 ;;
+      --output) outputs="$(append_csv "$outputs" "$2")"; shift 2 ;;
       --script) script="$2"; shift 2 ;;
       --stdin) stdin_mode=true; shift ;;
       --allow-dangerous) allow_dangerous=true; shift ;;
@@ -793,6 +963,9 @@ cmd_exec() {
     esac
   done
   [ "$stdin_mode" != "true" ] || [ -z "$script" ] || die "Use either --script or --stdin, not both."
+  apply_context_override "$account_override" "$remote_override"
+  cwd="$REMOTE_ROOT"
+  [ -z "$cwd_arg" ] || cwd="$(remote_join "$cwd_arg")"
 
   local cmd="" tmp_name result pid status_path remote_cmd detach_rc
   if [ -n "$script" ]; then
@@ -838,14 +1011,28 @@ cmd_exec() {
   status_path="$REMOTE_ROOT/.autodl-remote/jobs/$name.status"
   info "log=$log"
   if [ "$detach" = "true" ]; then
-    remote_cmd="mkdir -p $(shell_quote "$(dirname "$log")") $(shell_quote "$(dirname "$status_path")") && ( started_at=\$(date +%Y-%m-%dT%H:%M:%S%z); pid=\$BASHPID; printf 'status=running\npid=%s\nstarted_at=%s\nlog=%s\ncwd=%s\n' \"\$pid\" \"\$started_at\" $(shell_quote "$log") $(shell_quote "$cwd") > $(shell_quote "$status_path"); cd $(shell_quote "$cwd") && bash -lc $(shell_quote "$cmd") > $(shell_quote "$log") 2>&1; rc=\$?; finished_at=\$(date +%Y-%m-%dT%H:%M:%S%z); printf 'status=exited\npid=%s\nstarted_at=%s\nfinished_at=%s\nexit_code=%s\nlog=%s\ncwd=%s\n' \"\$pid\" \"\$started_at\" \"\$finished_at\" \"\$rc\" $(shell_quote "$log") $(shell_quote "$cwd") > $(shell_quote "$status_path"); ) < /dev/null & printf 'pid=%s\nlog=%s\nstatus=%s\n' \"\$!\" $(shell_quote "$log") $(shell_quote "$status_path")"
+    local runner
+    runner="$REMOTE_ROOT/.autodl-remote/tmp/$name.runner.sh"
+    upload_stdin_to_remote "$runner" <<EOF
+#!/usr/bin/env bash
+set +e
+started_at=\$(date +%Y-%m-%dT%H:%M:%S%z)
+pid=\$BASHPID
+printf 'status=running\npid=%s\nstarted_at=%s\nlog=%s\ncwd=%s\n' "\$pid" "\$started_at" $(shell_quote "$log") $(shell_quote "$cwd") > $(shell_quote "$status_path")
+cd $(shell_quote "$cwd") && bash -lc $(shell_quote "$cmd") > $(shell_quote "$log") 2>&1
+rc=\$?
+finished_at=\$(date +%Y-%m-%dT%H:%M:%S%z)
+printf 'status=exited\npid=%s\nstarted_at=%s\nfinished_at=%s\nexit_code=%s\nlog=%s\ncwd=%s\n' "\$pid" "\$started_at" "\$finished_at" "\$rc" $(shell_quote "$log") $(shell_quote "$cwd") > $(shell_quote "$status_path")
+exit "\$rc"
+EOF
+    remote_cmd="mkdir -p $(shell_quote "$(dirname "$log")") $(shell_quote "$(dirname "$status_path")") && chmod +x $(shell_quote "$runner") && if command -v setsid >/dev/null 2>&1; then setsid bash $(shell_quote "$runner") < /dev/null > /dev/null 2>&1 & else nohup bash $(shell_quote "$runner") < /dev/null > /dev/null 2>&1 & fi; printf 'pid=%s\nlog=%s\nstatus=%s\n' \"\$!\" $(shell_quote "$log") $(shell_quote "$status_path")"
     result="$(ssh_capture "bash -lc $(shell_quote "$remote_cmd")" 2>&1)"
     detach_rc=$?
     printf '%s\n' "$result"
     [ "$detach_rc" -eq 0 ] || return "$detach_rc"
     pid="$(printf '%s\n' "$result" | awk -F= '$1=="pid"{print $2; exit}')"
     [ -n "$pid" ] || die "Remote detach did not return a pid."
-    write_job "$name" "$pid" "$log" "$status_path" "$cwd" "$cmd"
+    write_job "$name" "$pid" "$log" "$status_path" "$cwd" "$cmd" "$model" "$tags" "$purpose" "$stage" "$outputs"
     write_history exec-detach "$cmd log=$log"
   else
     local inner rc
@@ -859,15 +1046,18 @@ cmd_exec() {
 
 cmd_put() {
   load_project
-  local dry_run=false delete=false
+  local dry_run=false delete=false account_override="" remote_override=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --account) account_override="$2"; shift 2 ;;
+      --remote) remote_override="$2"; shift 2 ;;
       --dry-run) dry_run=true; shift ;;
       --delete) delete=true; shift ;;
       --) shift; break ;;
       *) break ;;
     esac
   done
+  apply_context_override "$account_override" "$remote_override"
   [ $# -ge 1 ] || die "put requires <local-path> [remote-path]"
   local local_arg="$1" remote_arg="${2:-}" local_path remote_path
   local_path="$(local_join "$local_arg")"
@@ -900,14 +1090,17 @@ cmd_put() {
 
 cmd_get() {
   load_project
-  local dry_run=false
+  local dry_run=false account_override="" remote_override=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --account) account_override="$2"; shift 2 ;;
+      --remote) remote_override="$2"; shift 2 ;;
       --dry-run) dry_run=true; shift ;;
       --) shift; break ;;
       *) break ;;
     esac
   done
+  apply_context_override "$account_override" "$remote_override"
   [ $# -ge 1 ] || die "get requires <remote-path> [local-path]"
   local remote_arg="$1" local_arg="${2:-}" remote_path local_path kind
   remote_path="$(remote_join "$remote_arg")"
@@ -944,9 +1137,11 @@ cmd_get() {
 
 cmd_tree() {
   load_project
-  local path="." depth=3 limit=500
+  local path="." depth=3 limit=500 account_override="" remote_override=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --account) account_override="$2"; shift 2 ;;
+      --remote) remote_override="$2"; shift 2 ;;
       --depth) depth="$2"; shift 2 ;;
       --limit) limit="$2"; shift 2 ;;
       --) shift; break ;;
@@ -954,6 +1149,7 @@ cmd_tree() {
       *) path="$1"; shift ;;
     esac
   done
+  apply_context_override "$account_override" "$remote_override"
   local remote_path
   remote_path="$(remote_join "$path")"
   ssh_capture "cd $(shell_quote "$remote_path") && { find . -maxdepth $depth | sed 's#^./##' | sort | head -n $limit; true; }"
@@ -961,36 +1157,52 @@ cmd_tree() {
 
 cmd_ls() {
   load_project
-  [ "${1:-}" = "--" ] && shift
+  local account_override="" remote_override=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account) account_override="$2"; shift 2 ;;
+      --remote) remote_override="$2"; shift 2 ;;
+      --) shift; break ;;
+      -*) die "unknown ls option: $1" ;;
+      *) break ;;
+    esac
+  done
+  apply_context_override "$account_override" "$remote_override"
   local path="${1:-.}"
   ssh_run "ls -lah $(shell_quote "$(remote_join "$path")")"
 }
 
 cmd_cat() {
   load_project
-  local lines=200
+  local lines=200 account_override="" remote_override=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --account) account_override="$2"; shift 2 ;;
+      --remote) remote_override="$2"; shift 2 ;;
       --lines) lines="$2"; shift 2 ;;
       --) shift; break ;;
       *) break ;;
     esac
   done
+  apply_context_override "$account_override" "$remote_override"
   [ $# -gt 0 ] || die "cat requires a path"
   ssh_run "sed -n '1,${lines}p' $(shell_quote "$(remote_join "$1")")"
 }
 
 cmd_tail() {
   load_project
-  local lines=120 follow=false
+  local lines=120 follow=false account_override="" remote_override=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --account) account_override="$2"; shift 2 ;;
+      --remote) remote_override="$2"; shift 2 ;;
       --lines) lines="$2"; shift 2 ;;
       --follow|-f) follow=true; shift ;;
       --) shift; break ;;
       *) break ;;
     esac
   done
+  apply_context_override "$account_override" "$remote_override"
   [ $# -gt 0 ] || die "tail requires a path"
   local flag=""
   [ "$follow" = "true" ] && flag="-f"
@@ -1031,8 +1243,11 @@ cmd_job_status() {
   cwd="$(job_get "$file" CWD)"
   command="$(job_get "$file" COMMAND)"
   [ -n "$pid" ] || die "Job has no recorded pid: $name"
+  apply_job_context "$file"
 
   info "name=$name"
+  info "account=$ACCOUNT_NAME"
+  info "remote_root=$REMOTE_ROOT"
   info "pid=$pid"
   info "cwd=$cwd"
   info "log=$log"
@@ -1066,6 +1281,7 @@ cmd_job_tail() {
   file="$(job_path "$name")"
   [ -f "$file" ] || die "Job not found: $name"
   log="$(job_get "$file" LOG_PATH)"
+  apply_job_context "$file"
   [ "$follow" = "true" ] && flag="-f"
   ssh_run "tail -n $lines $flag $(shell_quote "$log")"
 }
@@ -1080,6 +1296,409 @@ cmd_job() {
     tail) cmd_job_tail "$@" ;;
     *) die "unknown job command: $sub" ;;
   esac
+}
+
+cmd_run_list() {
+  load_project
+  local dir file name account remote model stage tags started status seen=false
+  dir="$(jobs_dir)"
+  mkdir -p "$dir"
+  if ls "$dir"/*.conf >/dev/null 2>&1; then
+    printf '%-24s %-14s %-12s %-12s %-16s %-20s %s\n' "run" "account" "status" "model" "stage" "started_at" "tags"
+    for file in "$dir"/*.conf; do
+      seen=true
+      name="$(job_get "$file" NAME)"
+      account="$(job_get "$file" ACCOUNT)"
+      remote="$(job_get "$file" REMOTE_ROOT)"
+      model="$(job_get "$file" MODEL)"
+      stage="$(job_get "$file" STAGE)"
+      tags="$(job_get "$file" TAGS)"
+      started="$(job_get "$file" STARTED_AT)"
+      [ -n "$account" ] || account="${PROJECT_BOUND_ACCOUNT:-$PROJECT_ACCOUNT}"
+      [ -n "$remote" ] || remote="${PROJECT_BOUND_REMOTE_ROOT:-$REMOTE_ROOT}"
+      status="$(job_remote_status_summary "$file")"
+      printf '%-24s %-14s %-12s %-12s %-16s %-20s %s\n' "$name" "$account" "$status" "${model:--}" "${stage:--}" "$started" "${tags:--}"
+    done
+  fi
+  [ "$seen" = "true" ] || info "No runs recorded."
+}
+
+cmd_run_note() {
+  load_project
+  [ $# -gt 0 ] || die "run note requires a run name"
+  local name file model="" tags="" purpose="" stage="" outputs=""
+  name="$(sanitize_name "$1")"
+  shift
+  file="$(job_path "$name")"
+  [ -f "$file" ] || die "Run not found: $name"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --model) model="$2"; shift 2 ;;
+      --tag) tags="$(append_csv "$tags" "$2")"; shift 2 ;;
+      --purpose) purpose="$2"; shift 2 ;;
+      --stage) stage="$2"; shift 2 ;;
+      --output) outputs="$(append_csv "$outputs" "$2")"; shift 2 ;;
+      *) die "unknown run note option: $1" ;;
+    esac
+  done
+  [ -z "$model" ] || config_set_in_file "$file" MODEL "$model"
+  if [ -n "$tags" ]; then
+    local existing_tags
+    existing_tags="$(job_get "$file" TAGS)"
+    [ -n "$existing_tags" ] && tags="$(append_csv "$existing_tags" "$tags")"
+    config_set_in_file "$file" TAGS "$tags"
+  fi
+  [ -z "$purpose" ] || config_set_in_file "$file" PURPOSE "$purpose"
+  [ -z "$stage" ] || config_set_in_file "$file" STAGE "$stage"
+  if [ -n "$outputs" ]; then
+    local existing_outputs
+    existing_outputs="$(job_get "$file" OUTPUTS)"
+    [ -n "$existing_outputs" ] && outputs="$(append_csv "$existing_outputs" "$outputs")"
+    config_set_in_file "$file" OUTPUTS "$outputs"
+  fi
+  info "Updated run: $name"
+}
+
+cmd_run_submit() {
+  local args=(--detach) uploads=() account_override="" remote_override=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account) account_override="$2"; args+=("$1" "$2"); shift 2 ;;
+      --remote) remote_override="$2"; args+=("$1" "$2"); shift 2 ;;
+      --sync-up) uploads+=("$2"); shift 2 ;;
+      --) shift; break ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "run submit requires a command after --"
+  local path
+  for path in "${uploads[@]}"; do
+    local put_args=()
+    [ -z "$account_override" ] || put_args+=(--account "$account_override")
+    [ -z "$remote_override" ] || put_args+=(--remote "$remote_override")
+    cmd_put "${put_args[@]}" "$path"
+  done
+  cmd_exec "${args[@]}" -- "$@"
+}
+
+cmd_run() {
+  [ $# -gt 0 ] || die "run requires a subcommand"
+  local sub="$1"
+  shift
+  case "$sub" in
+    submit) cmd_run_submit "$@" ;;
+    list|ls) cmd_run_list "$@" ;;
+    status) cmd_job_status "$@" ;;
+    tail) cmd_job_tail "$@" ;;
+    note) cmd_run_note "$@" ;;
+    *) die "unknown run command: $sub" ;;
+  esac
+}
+
+cmd_fleet_create() {
+  load_project
+  [ $# -gt 0 ] || die "fleet create requires a name"
+  local name dir
+  name="$1"
+  valid_name "$name" || die "Invalid fleet name: $name"
+  dir="$(fleet_dir "$name")"
+  mkdir -p "$dir"
+  info "Created fleet: $name"
+}
+
+cmd_fleet_add() {
+  load_project
+  [ $# -ge 2 ] || die "fleet add requires <fleet> <device>"
+  local fleet="$1" device="$2" account="$PROJECT_ACCOUNT" remote="$REMOTE_ROOT" tags="" file
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account) account="$2"; shift 2 ;;
+      --remote) remote="$2"; shift 2 ;;
+      --tags) tags="$2"; shift 2 ;;
+      *) die "unknown fleet add option: $1" ;;
+    esac
+  done
+  load_account "$account"
+  [ -n "$remote" ] || remote="$ACCOUNT_DEFAULT_REMOTE"
+  [ -n "$remote" ] || die "fleet add requires --remote or an account default remote."
+  remote="${remote%/}"
+  validate_remote_root "$remote"
+  mkdir -p "$(fleet_dir "$fleet")"
+  file="$(fleet_device_path "$fleet" "$device")"
+  cat > "$file" <<EOF
+FLEET="$(config_quote "$fleet")"
+NAME="$(config_quote "$device")"
+ACCOUNT="$(config_quote "$account")"
+REMOTE_ROOT="$(config_quote "$remote")"
+TAGS="$(config_quote "$tags")"
+ADDED_AT="$(date +%Y-%m-%dT%H:%M:%S%z)"
+EOF
+  info "Added $device -> $account:$remote to fleet $fleet"
+}
+
+cmd_fleet_list() {
+  load_project
+  local root fleet_dir file fleet device account remote tags seen=false
+  root="$(fleet_root)"
+  mkdir -p "$root"
+  if [ -n "$(find "$root" -mindepth 2 -maxdepth 2 -name '*.conf' -print -quit 2>/dev/null)" ]; then
+    printf '%-16s %-18s %-14s %-34s %s\n' "fleet" "device" "account" "remote_root" "tags"
+    while IFS= read -r file; do
+      [ -n "$file" ] || continue
+      seen=true
+      fleet="$(device_get "$file" FLEET)"
+      device="$(device_get "$file" NAME)"
+      account="$(device_get "$file" ACCOUNT)"
+      remote="$(device_get "$file" REMOTE_ROOT)"
+      tags="$(device_get "$file" TAGS)"
+      printf '%-16s %-18s %-14s %-34s %s\n' "$fleet" "$device" "$account" "$remote" "${tags:--}"
+    done <<EOF
+$(find "$root" -mindepth 2 -maxdepth 2 -name '*.conf' | sort)
+EOF
+  fi
+  [ "$seen" = "true" ] || info "No fleets recorded."
+}
+
+latest_run_for_device() {
+  local account="$1" remote="$2" dir file name latest_name="" latest_started="" started job_account job_remote
+  dir="$(jobs_dir)"
+  if ls "$dir"/*.conf >/dev/null 2>&1; then
+    for file in "$dir"/*.conf; do
+      job_account="$(job_get "$file" ACCOUNT)"
+      job_remote="$(job_get "$file" REMOTE_ROOT)"
+      [ -n "$job_account" ] || job_account="${PROJECT_BOUND_ACCOUNT:-$PROJECT_ACCOUNT}"
+      [ -n "$job_remote" ] || job_remote="${PROJECT_BOUND_REMOTE_ROOT:-$REMOTE_ROOT}"
+      [ "$job_account" = "$account" ] || continue
+      [ "$job_remote" = "$remote" ] || continue
+      started="$(job_get "$file" STARTED_AT)"
+      name="$(job_get "$file" NAME)"
+      if [ -z "$latest_started" ] || [ "$started" \> "$latest_started" ]; then
+        latest_started="$started"
+        latest_name="$name"
+      fi
+    done
+  fi
+  printf '%s\n' "${latest_name:--}"
+}
+
+print_device_status() {
+  local device="$1" account="$2" remote="$3" tags="$4" probe online host gpu disk current
+  load_account "$account"
+  REMOTE_ROOT="${remote%/}"
+  validate_remote_root "$REMOTE_ROOT"
+  probe="$(remote_probe)"
+  online="$(kv_get "$probe" online)"
+  host="$(kv_get "$probe" host)"
+  gpu="$(kv_get "$probe" gpu)"
+  disk="$(kv_get "$probe" disk)"
+  current="$(latest_run_for_device "$account" "$REMOTE_ROOT")"
+  printf '%-18s %-8s %-14s %-28s %-22s %-18s %s\n' "$device" "${online:-no}" "$account" "${gpu:--}" "${disk:--}" "$current" "${tags:--}"
+  [ "${online:-no}" = "yes" ] || printf '  error: %s\n' "$(kv_get "$probe" error)"
+  [ -n "$host" ] && printf '  host: %s remote: %s\n' "$host" "$REMOTE_ROOT"
+}
+
+cmd_fleet_status() {
+  load_project
+  local fleet="" file device account remote tags
+  [ $# -gt 0 ] && fleet="$1"
+  printf '%-18s %-8s %-14s %-28s %-22s %-18s %s\n' "device" "online" "account" "gpu" "disk" "current_run" "tags"
+  if [ -z "$fleet" ]; then
+    print_device_status "current" "$PROJECT_ACCOUNT" "$REMOTE_ROOT" "project"
+    return 0
+  fi
+  [ -d "$(fleet_dir "$fleet")" ] || die "Fleet not found: $fleet"
+  for file in "$(fleet_dir "$fleet")"/*.conf; do
+    [ -f "$file" ] || continue
+    device="$(device_get "$file" NAME)"
+    account="$(device_get "$file" ACCOUNT)"
+    remote="$(device_get "$file" REMOTE_ROOT)"
+    tags="$(device_get "$file" TAGS)"
+    print_device_status "$device" "$account" "$remote" "$tags"
+  done
+}
+
+cmd_fleet() {
+  [ $# -gt 0 ] || die "fleet requires a subcommand"
+  local sub="$1"
+  shift
+  case "$sub" in
+    create) cmd_fleet_create "$@" ;;
+    add) cmd_fleet_add "$@" ;;
+    list|ls) cmd_fleet_list "$@" ;;
+    status) cmd_fleet_status "$@" ;;
+    *) die "unknown fleet command: $sub" ;;
+  esac
+}
+
+dashboard_device_row() {
+  local device="$1" account="$2" remote="$3" tags="$4" probe online gpu disk current esc
+  load_account "$account"
+  REMOTE_ROOT="${remote%/}"
+  validate_remote_root "$REMOTE_ROOT"
+  probe="$(remote_probe)"
+  online="$(kv_get "$probe" online)"
+  gpu="$(kv_get "$probe" gpu)"
+  disk="$(kv_get "$probe" disk)"
+  current="$(latest_run_for_device "$account" "$REMOTE_ROOT")"
+  printf '<tr><td>%s</td><td class="%s">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n' \
+    "$(html_escape "$device")" \
+    "$([ "${online:-no}" = "yes" ] && printf online || printf offline)" \
+    "$(html_escape "${online:-no}")" \
+    "$(html_escape "$account")" \
+    "$(html_escape "${gpu:--}")" \
+    "$(html_escape "${disk:--}")" \
+    "$(html_escape "$current")" \
+    "$(html_escape "${tags:--}")"
+}
+
+remote_log_tail() {
+  local account="$1" remote="$2" log="$3" lines="$4" output rc
+  [ -n "$log" ] || { printf '[log missing]\n'; return 0; }
+  load_account "$account"
+  REMOTE_ROOT="${remote%/}"
+  validate_remote_root "$REMOTE_ROOT"
+  output="$(ssh_capture "if [ -f $(shell_quote "$log") ]; then tail -n $lines $(shell_quote "$log"); else printf '[log missing] %s\n' $(shell_quote "$log"); fi" 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf '%s\n' "$output"
+  else
+    printf '[log unavailable]\n%s\n' "$output"
+  fi
+}
+
+dashboard_run_rows() {
+  local scope_fleet="$1" lines="$2" dir file name account remote model stage tags started status log purpose include log_tail
+  dir="$(jobs_dir)"
+  if ls "$dir"/*.conf >/dev/null 2>&1; then
+    for file in "$dir"/*.conf; do
+      name="$(job_get "$file" NAME)"
+      account="$(job_get "$file" ACCOUNT)"
+      remote="$(job_get "$file" REMOTE_ROOT)"
+      model="$(job_get "$file" MODEL)"
+      stage="$(job_get "$file" STAGE)"
+      tags="$(job_get "$file" TAGS)"
+      started="$(job_get "$file" STARTED_AT)"
+      log="$(job_get "$file" LOG_PATH)"
+      purpose="$(job_get "$file" PURPOSE)"
+      [ -n "$account" ] || account="${PROJECT_BOUND_ACCOUNT:-$PROJECT_ACCOUNT}"
+      [ -n "$remote" ] || remote="${PROJECT_BOUND_REMOTE_ROOT:-$REMOTE_ROOT}"
+      include=true
+      if [ -z "$scope_fleet" ]; then
+        if [ "$account" != "${PROJECT_BOUND_ACCOUNT:-$PROJECT_ACCOUNT}" ] || [ "$remote" != "${PROJECT_BOUND_REMOTE_ROOT:-$REMOTE_ROOT}" ]; then
+          include=false
+        fi
+      else
+        include=false
+        local fleet_file fleet_account fleet_remote
+        for fleet_file in "$(fleet_dir "$scope_fleet")"/*.conf; do
+          [ -f "$fleet_file" ] || continue
+          fleet_account="$(device_get "$fleet_file" ACCOUNT)"
+          fleet_remote="$(device_get "$fleet_file" REMOTE_ROOT)"
+          if [ "$fleet_account" = "$account" ] && [ "$fleet_remote" = "$remote" ]; then
+            include=true
+            break
+          fi
+        done
+      fi
+      [ "$include" = "true" ] || continue
+      status="$(job_remote_status_summary "$file")"
+      printf '<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td><code>%s</code><div class="muted">%s</div></td></tr>\n' \
+        "$(html_escape "$name")" "$(html_escape "$account")" "$(html_escape "$status")" \
+        "$(html_escape "${model:--}")" "$(html_escape "${stage:--}")" "$(html_escape "$started")" \
+        "$(html_escape "${tags:--}")" "$(html_escape "$log")" "$(html_escape "$purpose")"
+      if [ "$lines" -gt 0 ]; then
+        log_tail="$(remote_log_tail "$account" "$remote" "$log" "$lines")"
+        printf '<tr class="log-row"><td colspan="8"><div class="log-title">%s · last %s lines</div><pre class="log">%s</pre></td></tr>\n' \
+          "$(html_escape "$name")" "$(html_escape "$lines")" "$(html_escape "$log_tail")"
+      fi
+    done
+  fi
+}
+
+render_dashboard() {
+  local fleet="$1" output="$2" lines="$3" refresh_seconds="${4:-}" generated_at title
+  mkdir -p "$(dirname "$output")"
+  generated_at="$(date +%Y-%m-%dT%H:%M:%S%z)"
+  if [ -n "$fleet" ]; then
+    [ -d "$(fleet_dir "$fleet")" ] || die "Fleet not found: $fleet"
+    title="Fleet $fleet"
+  else
+    title="Current Remote"
+  fi
+  {
+    printf '<!doctype html><html><head><meta charset="utf-8"><title>AutoDL Remote Dashboard</title><style>'
+    printf 'body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;margin:24px;background:#f6f7f9;color:#172033}h1{font-size:24px}table{border-collapse:collapse;width:100%%;background:#fff;margin:16px 0;border:1px solid #d9dee7}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid #edf0f5;font-size:14px;vertical-align:top}th{background:#eef2f7}.online{color:#087f5b;font-weight:700}.offline{color:#c92a2a;font-weight:700}.muted{color:#667085;font-size:12px;margin-top:4px}code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.summary{color:#475467;margin-bottom:18px}.log-row td{background:#0f172a;color:#dbeafe;padding:0}.log-title{font-size:12px;color:#93c5fd;padding:10px 12px;border-bottom:1px solid #1e293b}.log{margin:0;padding:12px;white-space:pre-wrap;overflow:auto;max-height:360px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45}.badge{display:inline-block;border:1px solid #d0d5dd;border-radius:999px;padding:2px 8px;font-size:12px;color:#475467;background:#fff}'
+    printf '</style>'
+    if [ -n "$refresh_seconds" ]; then
+      printf '<meta http-equiv="refresh" content="%s">' "$(html_escape "$refresh_seconds")"
+    fi
+    printf '</head><body>'
+    printf '<h1>AutoDL Remote Dashboard</h1><div class="summary">%s · generated %s · project %s' "$(html_escape "$title")" "$(html_escape "$generated_at")" "$(html_escape "$PROJECT_ROOT")"
+    if [ -n "$refresh_seconds" ]; then
+      printf ' · <span class="badge">refresh every %ss</span>' "$(html_escape "$refresh_seconds")"
+    fi
+    printf '</div>'
+    printf '<h2>Devices</h2><table><thead><tr><th>Device</th><th>Online</th><th>Account</th><th>GPU</th><th>Disk</th><th>Current Run</th><th>Tags</th></tr></thead><tbody>'
+    if [ -n "$fleet" ]; then
+      local device_file device account remote tags
+      for device_file in "$(fleet_dir "$fleet")"/*.conf; do
+        [ -f "$device_file" ] || continue
+        device="$(device_get "$device_file" NAME)"
+        account="$(device_get "$device_file" ACCOUNT)"
+        remote="$(device_get "$device_file" REMOTE_ROOT)"
+        tags="$(device_get "$device_file" TAGS)"
+        dashboard_device_row "$device" "$account" "$remote" "$tags"
+      done
+    else
+      dashboard_device_row "current" "$PROJECT_ACCOUNT" "$REMOTE_ROOT" "project"
+    fi
+    printf '</tbody></table>'
+    printf '<h2>Runs</h2><table><thead><tr><th>Run</th><th>Account</th><th>Status</th><th>Model</th><th>Stage</th><th>Started</th><th>Tags</th><th>Log / Notes</th></tr></thead><tbody>'
+    dashboard_run_rows "$fleet" "$lines"
+    printf '</tbody></table>'
+    printf '</body></html>\n'
+  } > "$output"
+}
+
+cmd_dashboard() {
+  load_project
+  local fleet="" output="" open_file=false watch_seconds="" lines=120 opened=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fleet) fleet="$2"; shift 2 ;;
+      --output) output="$2"; shift 2 ;;
+      --open) open_file=true; shift ;;
+      --watch) watch_seconds="$2"; shift 2 ;;
+      --lines) lines="$2"; shift 2 ;;
+      *) die "unknown dashboard option: $1" ;;
+    esac
+  done
+  case "$lines" in
+    ""|*[!0-9]*) die "--lines must be a non-negative integer" ;;
+  esac
+  if [ -n "$watch_seconds" ]; then
+    case "$watch_seconds" in
+      ""|0|*[!0-9]*) die "--watch must be a positive integer number of seconds" ;;
+    esac
+  fi
+  [ -z "$output" ] && output="$PROJECT_ROOT/$HISTORY_DIR/dashboard.html"
+  if [ -n "$watch_seconds" ]; then
+    while :; do
+      render_dashboard "$fleet" "$output" "$lines" "$watch_seconds"
+      info "Dashboard written: $output"
+      if [ "$open_file" = "true" ] && [ "$opened" = "false" ]; then
+        command -v open >/dev/null 2>&1 && open "$output" || info "open command not available."
+        opened=true
+      fi
+      sleep "$watch_seconds"
+    done
+  fi
+  render_dashboard "$fleet" "$output" "$lines"
+  info "Dashboard written: $output"
+  if [ "$open_file" = "true" ]; then
+    command -v open >/dev/null 2>&1 && open "$output" || info "open command not available."
+  fi
 }
 
 cmd_shutdown() {
@@ -1176,10 +1795,13 @@ main() {
   shift
   case "$cmd" in
     -h|--help|help) usage ;;
+    -V|--version|version) cmd_version ;;
     account) cmd_account "$@" ;;
     bind) cmd_bind "$@" ;;
     doctor) cmd_doctor "$@" ;;
     model-dir) cmd_model_dir "$@" ;;
+    fleet) cmd_fleet "$@" ;;
+    dashboard) cmd_dashboard "$@" ;;
     exec) cmd_exec "$@" ;;
     put-run) cmd_put_run "$@" ;;
     put|sync-up) cmd_put "$@" ;;
@@ -1189,6 +1811,7 @@ main() {
     cat) cmd_cat "$@" ;;
     tail) cmd_tail "$@" ;;
     job) cmd_job "$@" ;;
+    run) cmd_run "$@" ;;
     shutdown) cmd_shutdown "$@" ;;
     shell) cmd_shell "$@" ;;
     history) cmd_history "$@" ;;
