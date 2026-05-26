@@ -1011,9 +1011,10 @@ cmd_exec() {
   status_path="$REMOTE_ROOT/.autodl-remote/jobs/$name.status"
   info "log=$log"
   if [ "$detach" = "true" ]; then
-    local runner
+    local runner runner_local
     runner="$REMOTE_ROOT/.autodl-remote/tmp/$name.runner.sh"
-    upload_stdin_to_remote "$runner" <<EOF
+    runner_local="$(mktemp "${TMPDIR:-/tmp}/autodl-remote-runner.XXXXXX")" || die "mktemp failed"
+    cat > "$runner_local" <<EOF
 #!/usr/bin/env bash
 set +e
 started_at=\$(date +%Y-%m-%dT%H:%M:%S%z)
@@ -1025,6 +1026,8 @@ finished_at=\$(date +%Y-%m-%dT%H:%M:%S%z)
 printf 'status=exited\npid=%s\nstarted_at=%s\nfinished_at=%s\nexit_code=%s\nlog=%s\ncwd=%s\n' "\$pid" "\$started_at" "\$finished_at" "\$rc" $(shell_quote "$log") $(shell_quote "$cwd") > $(shell_quote "$status_path")
 exit "\$rc"
 EOF
+    upload_local_file "$runner_local" "$runner" || { rm -f "$runner_local"; return 1; }
+    rm -f "$runner_local"
     remote_cmd="mkdir -p $(shell_quote "$(dirname "$log")") $(shell_quote "$(dirname "$status_path")") && chmod +x $(shell_quote "$runner") && if command -v setsid >/dev/null 2>&1; then setsid bash $(shell_quote "$runner") < /dev/null > /dev/null 2>&1 & else nohup bash $(shell_quote "$runner") < /dev/null > /dev/null 2>&1 & fi; printf 'pid=%s\nlog=%s\nstatus=%s\n' \"\$!\" $(shell_quote "$log") $(shell_quote "$status_path")"
     result="$(ssh_capture "bash -lc $(shell_quote "$remote_cmd")" 2>&1)"
     detach_rc=$?
@@ -1531,27 +1534,6 @@ cmd_fleet() {
   esac
 }
 
-dashboard_device_row() {
-  local device="$1" account="$2" remote="$3" tags="$4" probe online gpu disk current esc
-  load_account "$account"
-  REMOTE_ROOT="${remote%/}"
-  validate_remote_root "$REMOTE_ROOT"
-  probe="$(remote_probe)"
-  online="$(kv_get "$probe" online)"
-  gpu="$(kv_get "$probe" gpu)"
-  disk="$(kv_get "$probe" disk)"
-  current="$(latest_run_for_device "$account" "$REMOTE_ROOT")"
-  printf '<tr><td>%s</td><td class="%s">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n' \
-    "$(html_escape "$device")" \
-    "$([ "${online:-no}" = "yes" ] && printf online || printf offline)" \
-    "$(html_escape "${online:-no}")" \
-    "$(html_escape "$account")" \
-    "$(html_escape "${gpu:--}")" \
-    "$(html_escape "${disk:--}")" \
-    "$(html_escape "$current")" \
-    "$(html_escape "${tags:--}")"
-}
-
 remote_log_tail() {
   local account="$1" remote="$2" log="$3" lines="$4" output rc
   [ -n "$log" ] || { printf '[log missing]\n'; return 0; }
@@ -1567,58 +1549,339 @@ remote_log_tail() {
   fi
 }
 
-dashboard_run_rows() {
-  local scope_fleet="$1" lines="$2" dir file name account remote model stage tags started status log purpose include log_tail
+dashboard_pct() {
+  local pct
+  pct="$(printf '%s\n' "$1" | awk 'match($0, /[0-9]+%/) { print substr($0, RSTART, RLENGTH - 1); exit }')"
+  case "$pct" in
+    ""|*[!0-9]*) pct=0 ;;
+  esac
+  [ "$pct" -gt 100 ] 2>/dev/null && pct=100
+  printf '%s\n' "$pct"
+}
+
+dashboard_gpu_model() {
+  local value="$1" model
+  model="$(printf '%s\n' "$value" | sed -E 's/[[:space:]][0-9]+\/[0-9]+ MiB [0-9]+%$//')"
+  [ -n "$model" ] || model="-"
+  printf '%s\n' "$model"
+}
+
+dashboard_gpu_mem() {
+  local value="$1" mem
+  mem="$(printf '%s\n' "$value" | sed -nE 's/.* ([0-9]+\/[0-9]+ MiB) [0-9]+%$/\1/p')"
+  [ -n "$mem" ] || mem="-"
+  printf '%s\n' "$mem"
+}
+
+dashboard_status_class() {
+  local online="$1" status="$2"
+  if [ "${online:-no}" != "yes" ]; then
+    printf 'offline\n'
+    return 0
+  fi
+  case "$status" in
+    running) printf 'training\n' ;;
+    unreachable|failed|error) printf 'error\n' ;;
+    *) printf 'idle\n' ;;
+  esac
+}
+
+dashboard_status_label() {
+  case "$1" in
+    training) printf '训练中\n' ;;
+    idle) printf '空闲\n' ;;
+    error) printf '异常\n' ;;
+    offline) printf '离线\n' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+dashboard_job_in_scope() {
+  local file="$1" scope_fleet="$2" account remote fleet_file fleet_account fleet_remote
+  account="$(job_get "$file" ACCOUNT)"
+  remote="$(job_get "$file" REMOTE_ROOT)"
+  [ -n "$account" ] || account="${PROJECT_BOUND_ACCOUNT:-$PROJECT_ACCOUNT}"
+  [ -n "$remote" ] || remote="${PROJECT_BOUND_REMOTE_ROOT:-$REMOTE_ROOT}"
+  if [ -z "$scope_fleet" ]; then
+    [ "$account" = "${PROJECT_BOUND_ACCOUNT:-$PROJECT_ACCOUNT}" ] && [ "$remote" = "${PROJECT_BOUND_REMOTE_ROOT:-$REMOTE_ROOT}" ]
+    return $?
+  fi
+  for fleet_file in "$(fleet_dir "$scope_fleet")"/*.conf; do
+    [ -f "$fleet_file" ] || continue
+    fleet_account="$(device_get "$fleet_file" ACCOUNT)"
+    fleet_remote="$(device_get "$fleet_file" REMOTE_ROOT)"
+    if [ "$fleet_account" = "$account" ] && [ "$fleet_remote" = "$remote" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+latest_job_file_for_device() {
+  local account="$1" remote="$2" dir file latest_file="" latest_started="" started job_account job_remote
   dir="$(jobs_dir)"
   if ls "$dir"/*.conf >/dev/null 2>&1; then
     for file in "$dir"/*.conf; do
+      job_account="$(job_get "$file" ACCOUNT)"
+      job_remote="$(job_get "$file" REMOTE_ROOT)"
+      [ -n "$job_account" ] || job_account="${PROJECT_BOUND_ACCOUNT:-$PROJECT_ACCOUNT}"
+      [ -n "$job_remote" ] || job_remote="${PROJECT_BOUND_REMOTE_ROOT:-$REMOTE_ROOT}"
+      [ "$job_account" = "$account" ] || continue
+      [ "$job_remote" = "$remote" ] || continue
+      started="$(job_get "$file" STARTED_AT)"
+      if [ -z "$latest_started" ] || [ "$started" \> "$latest_started" ]; then
+        latest_started="$started"
+        latest_file="$file"
+      fi
+    done
+  fi
+  printf '%s\n' "$latest_file"
+}
+
+dashboard_device_card() {
+  local device="$1" account="$2" remote="$3" tags="$4" lines="$5"
+  local probe online host gpu disk processes current_file current status status_class status_label
+  local gpu_util gpu_model gpu_mem disk_pct log log_tail model stage purpose started card_id
+
+  DASHBOARD_DEVICE_TOTAL=$((DASHBOARD_DEVICE_TOTAL + 1))
+  load_account "$account"
+  REMOTE_ROOT="${remote%/}"
+  validate_remote_root "$REMOTE_ROOT"
+  probe="$(remote_probe)"
+  online="$(kv_get "$probe" online)"
+  host="$(kv_get "$probe" host)"
+  gpu="$(kv_get "$probe" gpu)"
+  disk="$(kv_get "$probe" disk)"
+  processes="$(kv_get "$probe" processes)"
+  current_file="$(latest_job_file_for_device "$account" "$REMOTE_ROOT")"
+  current="-"
+  status="idle"
+  log=""
+  log_tail="[no recorded run]"
+  model="-"
+  stage="-"
+  purpose=""
+  started="-"
+  if [ -n "$current_file" ]; then
+    current="$(job_get "$current_file" NAME)"
+    status="$(job_remote_status_summary "$current_file")"
+    log="$(job_get "$current_file" LOG_PATH)"
+    model="$(job_get "$current_file" MODEL)"
+    stage="$(job_get "$current_file" STAGE)"
+    purpose="$(job_get "$current_file" PURPOSE)"
+    started="$(job_get "$current_file" STARTED_AT)"
+    [ -n "$model" ] || model="-"
+    [ -n "$stage" ] || stage="-"
+    if [ "$lines" -gt 0 ]; then
+      log_tail="$(remote_log_tail "$account" "$REMOTE_ROOT" "$log" "$lines")"
+    else
+      log_tail="[log hidden: --lines 0]"
+    fi
+  elif [ -n "$processes" ]; then
+    log_tail="$processes"
+  fi
+
+  status_class="$(dashboard_status_class "$online" "$status")"
+  status_label="$(dashboard_status_label "$status_class")"
+  case "$status_class" in
+    training) DASHBOARD_TRAINING_TOTAL=$((DASHBOARD_TRAINING_TOTAL + 1)) ;;
+    idle) DASHBOARD_IDLE_TOTAL=$((DASHBOARD_IDLE_TOTAL + 1)) ;;
+    error) DASHBOARD_ERROR_TOTAL=$((DASHBOARD_ERROR_TOTAL + 1)) ;;
+    offline) DASHBOARD_OFFLINE_TOTAL=$((DASHBOARD_OFFLINE_TOTAL + 1)) ;;
+  esac
+  [ "${online:-no}" = "yes" ] && DASHBOARD_ONLINE_TOTAL=$((DASHBOARD_ONLINE_TOTAL + 1))
+
+  gpu="${gpu:--}"
+  disk="${disk:--}"
+  gpu_util="$(dashboard_pct "$gpu")"
+  disk_pct="$(dashboard_pct "$disk")"
+  gpu_model="$(dashboard_gpu_model "$gpu")"
+  gpu_mem="$(dashboard_gpu_mem "$gpu")"
+  card_id="$(sanitize_name "${device}-${account}")"
+  DASHBOARD_HEAT_CELLS="${DASHBOARD_HEAT_CELLS}<span class=\"heat-cell heat-${status_class}\" title=\"$(html_escape "$device · ${gpu_util}%")\" style=\"--v:${gpu_util}%\"></span>"
+
+  printf '<article class="mc mc-%s" data-status="%s">\n' "$status_class" "$status_class"
+  printf '<div class="mc-head"><div class="mc-head-l"><div class="mc-id"><span class="mc-bracket">[</span><span class="mc-id-text">%s</span><span class="mc-bracket">]</span></div><div class="mc-name">%s</div><div class="mc-sub"><span>%s</span><span class="sep">·</span><span>%s</span></div></div><div class="mc-head-r"><span class="st-badge"><span class="st-dot"></span>%s</span><div class="mc-uptime">%s</div></div></div>\n' \
+    "$(html_escape "$device")" "$(html_escape "$account")" "$(html_escape "${host:--}")" "$(html_escape "${tags:--}")" "$(html_escape "$status_label")" "$(html_escape "${status:-unknown}")"
+  printf '<div class="mc-agg"><div class="mc-agg-l"><span class="agg-k">GPU UTIL</span><span class="agg-v">%s<span class="pct-s">%%</span></span></div><div class="ubar-wrap"><div class="ubar-track"></div><div class="ubar-fill" style="width:%s%%"></div></div><div class="mc-agg-r">%s</div></div>\n' \
+    "$(html_escape "$gpu_util")" "$(html_escape "$gpu_util")" "$(html_escape "$gpu_mem")"
+  printf '<div class="gpu-row"><div class="gpu-row-head"><span class="gpu-tag">GPU</span><span class="gpu-model">%s</span><span class="gpu-util-pct">%s<span class="pct-s">%%</span></span></div><div class="gpu-row-meta"><span class="meta-cell"><span class="meta-k">DISK</span><span class="meta-v">%s</span><span class="meta-mini-bar"><span style="width:%s%%"></span></span></span><span class="meta-cell"><span class="meta-k">REMOTE</span><span class="meta-v">%s</span></span></div></div>\n' \
+    "$(html_escape "$gpu_model")" "$(html_escape "$gpu_util")" "$(html_escape "$disk")" "$(html_escape "$disk_pct")" "$(html_escape "$REMOTE_ROOT")"
+  printf '<div class="mc-task"><div class="task-row"><span class="task-arrow">▸</span><span class="task-name">%s</span></div><div class="task-meta">%s · %s · %s</div>' \
+    "$(html_escape "$current")" "$(html_escape "$model")" "$(html_escape "$stage")" "$(html_escape "$started")"
+  [ -n "$purpose" ] && printf '<div class="task-purpose">%s</div>' "$(html_escape "$purpose")"
+  printf '</div>\n'
+  printf '<div class="mc-term"><div class="term-bar"><span class="term-dot"></span><span class="term-bar-t">%s</span><span class="term-bar-eta">last %s</span></div><pre class="term-body" data-term-id="%s">%s</pre></div>\n' \
+    "$(html_escape "${log:-processes}")" "$(html_escape "$lines")" "$(html_escape "$card_id")" "$(html_escape "$log_tail")"
+  printf '</article>\n'
+}
+
+dashboard_device_cards() {
+  local fleet="$1" lines="$2" device_file device account remote tags
+  if [ -n "$fleet" ]; then
+    for device_file in "$(fleet_dir "$fleet")"/*.conf; do
+      [ -f "$device_file" ] || continue
+      device="$(device_get "$device_file" NAME)"
+      account="$(device_get "$device_file" ACCOUNT)"
+      remote="$(device_get "$device_file" REMOTE_ROOT)"
+      tags="$(device_get "$device_file" TAGS)"
+      dashboard_device_card "$device" "$account" "$remote" "$tags" "$lines"
+    done
+  else
+    dashboard_device_card "current" "$PROJECT_ACCOUNT" "$REMOTE_ROOT" "project" "$lines"
+  fi
+}
+
+dashboard_run_tiles() {
+  local scope_fleet="$1" dir file name account remote model stage started log purpose
+  dir="$(jobs_dir)"
+  printf '<section class="run-panel"><div class="sec-t"><span class="sec-t-l">─ RUNS</span><span class="sec-t-line"></span></div><div class="run-list">\n'
+  if ls "$dir"/*.conf >/dev/null 2>&1; then
+    for file in "$dir"/*.conf; do
+      dashboard_job_in_scope "$file" "$scope_fleet" || continue
+      DASHBOARD_RUN_TOTAL=$((DASHBOARD_RUN_TOTAL + 1))
       name="$(job_get "$file" NAME)"
       account="$(job_get "$file" ACCOUNT)"
       remote="$(job_get "$file" REMOTE_ROOT)"
       model="$(job_get "$file" MODEL)"
       stage="$(job_get "$file" STAGE)"
-      tags="$(job_get "$file" TAGS)"
       started="$(job_get "$file" STARTED_AT)"
       log="$(job_get "$file" LOG_PATH)"
       purpose="$(job_get "$file" PURPOSE)"
       [ -n "$account" ] || account="${PROJECT_BOUND_ACCOUNT:-$PROJECT_ACCOUNT}"
       [ -n "$remote" ] || remote="${PROJECT_BOUND_REMOTE_ROOT:-$REMOTE_ROOT}"
-      include=true
-      if [ -z "$scope_fleet" ]; then
-        if [ "$account" != "${PROJECT_BOUND_ACCOUNT:-$PROJECT_ACCOUNT}" ] || [ "$remote" != "${PROJECT_BOUND_REMOTE_ROOT:-$REMOTE_ROOT}" ]; then
-          include=false
-        fi
-      else
-        include=false
-        local fleet_file fleet_account fleet_remote
-        for fleet_file in "$(fleet_dir "$scope_fleet")"/*.conf; do
-          [ -f "$fleet_file" ] || continue
-          fleet_account="$(device_get "$fleet_file" ACCOUNT)"
-          fleet_remote="$(device_get "$fleet_file" REMOTE_ROOT)"
-          if [ "$fleet_account" = "$account" ] && [ "$fleet_remote" = "$remote" ]; then
-            include=true
-            break
-          fi
-        done
-      fi
-      [ "$include" = "true" ] || continue
-      status="$(job_remote_status_summary "$file")"
-      printf '<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td><code>%s</code><div class="muted">%s</div></td></tr>\n' \
-        "$(html_escape "$name")" "$(html_escape "$account")" "$(html_escape "$status")" \
-        "$(html_escape "${model:--}")" "$(html_escape "${stage:--}")" "$(html_escape "$started")" \
-        "$(html_escape "${tags:--}")" "$(html_escape "$log")" "$(html_escape "$purpose")"
-      if [ "$lines" -gt 0 ]; then
-        log_tail="$(remote_log_tail "$account" "$remote" "$log" "$lines")"
-        printf '<tr class="log-row"><td colspan="8"><div class="log-title">%s · last %s lines</div><pre class="log">%s</pre></td></tr>\n' \
-          "$(html_escape "$name")" "$(html_escape "$lines")" "$(html_escape "$log_tail")"
-      fi
+      printf '<div class="run-chip"><div class="run-chip-h"><span>%s</span><span>%s</span></div><div class="run-chip-m">%s · %s · %s</div><div class="run-chip-f">%s</div><div class="run-chip-note">%s</div></div>\n' \
+        "$(html_escape "$name")" "$(html_escape "${stage:--}")" "$(html_escape "$account")" "$(html_escape "${model:--}")" "$(html_escape "$started")" "$(html_escape "$log")" "$(html_escape "$purpose")"
     done
   fi
+  if [ "$DASHBOARD_RUN_TOTAL" -eq 0 ]; then
+    printf '<div class="empty">NO RUNS RECORDED</div>\n'
+  fi
+  printf '</div></section>\n'
 }
 
-render_dashboard() {
-  local fleet="$1" output="$2" lines="$3" refresh_seconds="${4:-}" generated_at title
-  mkdir -p "$(dirname "$output")"
+dashboard_state_path() {
+  local output="$1" dir base
+  dir="$(dirname "$output")"
+  base="$(basename "$output")"
+  case "$base" in
+    *.html) base="${base%.html}.state.js" ;;
+    *) base="$base.state.js" ;;
+  esac
+  printf '%s/%s\n' "$dir" "$base"
+}
+
+js_string() {
+  printf '"'
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+  printf '"'
+}
+
+base64_file_compact() {
+  base64 < "$1" | tr -d '\n'
+}
+
+dashboard_css() {
+  cat <<'EOF'
+:root{--bg:#fdf6e3;--bg-2:#f3ead0;--card:#fffbef;--card-2:#f7efd5;--border:#e1d6a8;--border-2:#cdc295;--border-soft:#ebe1b8;--fg:#073642;--fg-dim:#586e75;--dim:#93a1a1;--muted:#93a1a1;--muted-strong:#657b83;--ok:#859900;--hot:#dc322f;--warm:#b58900;--cool:#268bd2;--err:#dc322f;--off:#93a1a1;--off-bg:#e1d6a8;--term-bg:#002b36;--term-fg:#93a1a1}*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--fg)}body{font-family:"JetBrains Mono","IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;-webkit-font-smoothing:antialiased;overflow-x:hidden}.app{min-height:100vh;background:radial-gradient(ellipse 1200px 600px at 50% -200px,rgba(133,153,0,.09),transparent 70%),linear-gradient(var(--bg),var(--bg-2));display:flex;flex-direction:column}.scanlines{position:fixed;inset:0;pointer-events:none;z-index:50;background-image:repeating-linear-gradient(to bottom,rgba(0,0,0,0) 0,rgba(0,0,0,0) 2px,rgba(0,0,0,.025) 3px,rgba(0,0,0,0) 4px);mix-blend-mode:multiply}.vignette{position:fixed;inset:0;pointer-events:none;z-index:49;box-shadow:inset 0 0 180px rgba(0,0,0,.08)}.topbar{position:sticky;top:0;z-index:30;background:rgba(253,246,227,.88);backdrop-filter:blur(10px) saturate(150%);border-bottom:1px solid var(--border);padding:14px 22px 0;display:grid;grid-template-columns:minmax(280px,1fr) minmax(420px,1.4fr) minmax(260px,1fr);grid-template-rows:auto auto;grid-template-areas:"l c r" "f f f";gap:16px 24px;align-items:center}.topbar-l{grid-area:l;display:flex;flex-direction:column;gap:6px}.topbar-c{grid-area:c;display:flex;justify-content:center}.topbar-r{grid-area:r;display:flex;justify-content:flex-end;align-items:center;gap:20px}.filters{grid-area:f;display:flex;gap:8px;padding:10px 0;border-top:1px dashed var(--border-2);align-items:center}.brand{display:flex;align-items:center;gap:10px}.brand-mark{width:22px;height:22px;display:inline-grid;place-items:center;background:var(--ok);color:var(--bg);font-size:14px;border-radius:3px;box-shadow:0 0 12px rgba(133,153,0,.38)}.brand-name{font-size:17px;font-weight:700;letter-spacing:.14em}.brand-sub{font-size:11px;font-weight:600;letter-spacing:.22em;color:var(--fg-dim);padding:2px 6px;border:1px solid var(--border);border-radius:2px}.brand-ver{font-size:10px;color:var(--muted);margin-left:4px}.brand-tagline{font-size:11px;color:var(--fg-dim);letter-spacing:.02em}.agg-block{width:100%;max-width:560px;border:1px solid var(--border);background:var(--card);padding:8px 12px 9px;border-radius:4px}.agg-block-h{display:flex;justify-content:space-between;font-size:10.5px;letter-spacing:.12em;margin-bottom:6px}.heatmap{display:flex;gap:2px;height:16px;margin-bottom:6px}.heat-cell{display:block;flex:1;border-radius:1px;background:var(--off-bg);opacity:.65}.heat-training{background:var(--ok);opacity:.9}.heat-idle{background:var(--cool);opacity:.45}.heat-error{background:var(--err);opacity:.85}.heat-offline{background:var(--off-bg);opacity:.7}.agg-block-f{font-size:10.5px;letter-spacing:.04em;color:var(--dim)}.clock{text-align:right}.clock-t{font-size:22px;font-weight:600;letter-spacing:.06em;font-variant-numeric:tabular-nums}.clock-d{font-size:10.5px;letter-spacing:.08em;margin-top:2px;color:var(--dim)}.refresh{display:flex;flex-direction:column;gap:4px;align-items:flex-end}.refresh>.dim{font-size:10px;letter-spacing:.14em;color:var(--dim)}.seg{display:flex;border:1px solid var(--border);border-radius:3px;overflow:hidden}.seg-btn{appearance:none;background:transparent;border:0;padding:4px 10px;color:var(--fg-dim);font:inherit;font-size:11px;border-right:1px solid var(--border);font-variant-numeric:tabular-nums}.seg-btn:last-child{border-right:0}.seg-btn.on{color:var(--bg);background:var(--ok)}.flt{appearance:none;background:transparent;border:1px solid var(--border);color:var(--fg-dim);font:inherit;font-size:11px;padding:5px 12px;cursor:pointer;border-radius:3px;display:inline-flex;align-items:center;gap:8px;letter-spacing:.02em}.flt-c{color:var(--muted);font-variant-numeric:tabular-nums;font-size:10px}.flt:hover{color:var(--fg);border-color:var(--fg-dim)}.flt.on{color:var(--bg);background:var(--ok);border-color:var(--ok)}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:14px;padding:18px 22px 26px;flex:1}.mc{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:14px 14px 0;display:flex;flex-direction:column;gap:12px;position:relative;overflow:hidden}.mc::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--accent,var(--ok));opacity:.85}.mc-training{--accent:var(--ok)}.mc-idle{--accent:var(--cool)}.mc-error{--accent:var(--err);background:linear-gradient(180deg,rgba(220,50,47,.06),var(--card))}.mc-offline{--accent:var(--off);opacity:.72}.mc-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.mc-head-l{display:flex;flex-direction:column;gap:3px;min-width:0}.mc-head-r{display:flex;flex-direction:column;align-items:flex-end;gap:4px}.mc-id{font-size:10.5px;color:var(--dim);letter-spacing:.06em}.mc-bracket{color:var(--muted-strong)}.mc-id-text{color:var(--fg-dim);padding:0 1px}.mc-name{font-size:15px;font-weight:600;letter-spacing:.02em}.mc-sub{font-size:10.5px;color:var(--fg-dim);display:flex;gap:6px;align-items:center;min-width:0}.mc-sub span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mc-sub .sep{color:var(--muted-strong);flex:0 0 auto}.st-badge{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;padding:3px 8px;border:1px solid var(--accent);border-radius:2px;letter-spacing:.06em;color:var(--accent);background:rgba(133,153,0,.07)}.st-dot{width:6px;height:6px;border-radius:50%;display:inline-block;background:var(--accent);box-shadow:0 0 8px var(--accent)}.mc-idle .st-dot,.mc-offline .st-dot{box-shadow:none}.mc-uptime{font-size:10.5px;color:var(--dim);font-variant-numeric:tabular-nums;letter-spacing:.04em}.mc-agg{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;padding:6px 8px;background:var(--card-2);border:1px solid var(--border-soft);border-radius:3px}.mc-agg-l{display:flex;align-items:baseline;gap:6px}.mc-agg-r{font-size:10.5px;color:var(--fg-dim);font-variant-numeric:tabular-nums}.agg-k{font-size:9.5px;letter-spacing:.14em;color:var(--dim)}.agg-v{font-size:14px;font-weight:600;color:var(--accent);font-variant-numeric:tabular-nums}.pct-s{font-size:10px;opacity:.7;margin-left:1px}.ubar-wrap{position:relative;width:100%;min-width:40px;height:3px}.ubar-track{position:absolute;inset:0;background:rgba(7,54,66,.10);border-radius:1px}.ubar-fill{position:absolute;left:0;top:0;height:3px;border-radius:1px;background:var(--accent);box-shadow:0 0 8px var(--accent);transition:width 1.2s cubic-bezier(.4,0,.2,1)}.gpu-row{display:flex;flex-direction:column;gap:7px}.gpu-row-head{display:flex;align-items:center;gap:10px;font-size:11px}.gpu-tag{padding:1px 5px;background:rgba(7,54,66,.08);color:var(--fg-dim);border-radius:2px;font-size:9.5px;letter-spacing:.08em;font-weight:600}.gpu-model{color:var(--fg-dim);flex:1;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gpu-util-pct{font-size:14px;font-weight:600;color:var(--accent);font-variant-numeric:tabular-nums}.gpu-row-meta{display:grid;grid-template-columns:1.1fr 1.4fr;gap:8px}.meta-cell{display:flex;align-items:center;gap:5px;font-size:10.5px;min-width:0}.meta-k{color:var(--dim);font-size:9px;letter-spacing:.1em;font-weight:600}.meta-v{color:var(--fg);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.meta-mini-bar{flex:1;min-width:18px;height:3px;background:rgba(7,54,66,.10);border-radius:1px;overflow:hidden}.meta-mini-bar>span{display:block;height:100%;background:var(--accent)}.mc-task{padding:8px 10px;background:var(--card-2);border:1px solid var(--border-soft);border-left:2px solid var(--accent);border-radius:2px;display:flex;flex-direction:column;gap:3px}.task-row{display:flex;align-items:center;gap:6px;min-width:0}.task-arrow{color:var(--accent)}.task-name{font-size:12px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.task-meta,.task-purpose{font-size:10.5px;color:var(--fg-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mc-term{margin:0 -14px;background:var(--term-bg);border-top:1px solid var(--border)}.term-bar{display:flex;align-items:center;gap:8px;padding:5px 14px;font-size:10px;color:var(--dim);border-bottom:1px solid #073642;letter-spacing:.04em}.term-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 6px var(--accent);animation:blink 2s ease-in-out infinite}.mc-idle .term-dot,.mc-offline .term-dot{box-shadow:none;animation:none}@keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}.term-bar-t{flex:1;color:var(--term-fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.term-bar-eta{color:var(--dim)}.term-body{margin:0;padding:10px 14px 12px;font-size:10.5px;line-height:1.55;color:var(--term-fg);height:260px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;scrollbar-width:thin;scrollbar-color:#073642 transparent}.term-body::-webkit-scrollbar{width:8px}.term-body::-webkit-scrollbar-thumb{background:#073642;border-radius:4px}.run-panel{padding:0 22px 72px}.sec-t{display:flex;align-items:center;gap:10px;font-size:10.5px;letter-spacing:.14em;color:var(--dim);font-weight:600;margin:2px 0 12px}.sec-t-line{flex:1;height:1px;background:var(--border)}.run-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}.run-chip{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:10px 12px;min-width:0}.run-chip-h{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:var(--fg)}.run-chip-h span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.run-chip-m,.run-chip-f,.run-chip-note{font-size:10.5px;color:var(--fg-dim);margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.run-chip-f{color:var(--dim)}.empty{border:1px dashed var(--border);color:var(--dim);padding:16px;font-size:12px;text-align:center}.ticker{position:fixed;left:0;right:0;bottom:0;z-index:25;height:28px;display:flex;align-items:center;background:rgba(253,246,227,.92);backdrop-filter:blur(8px);border-top:1px solid var(--border);font-size:10.5px;overflow:hidden}.ticker-tag{padding:4px 10px;background:var(--ok);color:var(--bg);font-weight:700;letter-spacing:.12em;margin-right:12px;height:100%;display:flex;align-items:center}.ticker-row{display:flex;gap:28px;white-space:nowrap;color:var(--fg-dim)}@media (max-width:900px){.topbar{grid-template-columns:1fr;grid-template-areas:"l" "c" "r" "f"}.topbar-c,.topbar-r{justify-content:flex-start}.grid{grid-template-columns:1fr;padding:14px 14px 28px}.filters{overflow:auto}.term-body{height:220px}}@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+EOF
+}
+
+dashboard_js() {
+  cat <<'EOF'
+(function(){
+  const pageKey = "autodl-dashboard:" + location.pathname;
+  const stateSrc = window.__AUTODL_STATE_SRC__;
+  const refreshSeconds = Number(window.__AUTODL_REFRESH_SECONDS__ || 0);
+  let currentFilter = sessionStorage.getItem(pageKey + ":filter") || "all";
+  function atBottom(el){ return el.scrollHeight - el.scrollTop - el.clientHeight < 24; }
+  function captureTerms(){
+    const terms = {};
+    document.querySelectorAll(".term-body").forEach((el) => {
+      const id = el.dataset.termId || "";
+      terms[id] = { top: el.scrollTop, follow: atBottom(el) };
+    });
+    return terms;
+  }
+  function restoreTerms(prev){
+    document.querySelectorAll(".term-body").forEach((el) => {
+      const id = el.dataset.termId || "";
+      const item = prev[id];
+      if (!item || item.follow) el.scrollTop = el.scrollHeight;
+      else el.scrollTop = item.top || 0;
+      el.addEventListener("scroll", saveScroll, { passive: true });
+    });
+  }
+  function saveScroll(){
+    const next = { pageY: window.scrollY, terms: captureTerms() };
+    sessionStorage.setItem(pageKey, JSON.stringify(next));
+  }
+  function setText(id, value){
+    const el = document.getElementById(id);
+    if (el) el.textContent = value == null ? "" : String(value);
+  }
+  function setHtml(id, value){
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = value || "";
+  }
+  function applyFilter(filter){
+    currentFilter = filter || "all";
+    sessionStorage.setItem(pageKey + ":filter", currentFilter);
+    document.querySelectorAll("[data-filter]").forEach((b) => b.classList.toggle("on", b.dataset.filter === currentFilter));
+    document.querySelectorAll(".mc").forEach((card) => {
+      card.hidden = currentFilter !== "all" && card.dataset.status !== currentFilter;
+    });
+  }
+  function applyState(state){
+    if (!state) return;
+    const previousTerms = captureTerms();
+    const previousY = window.scrollY;
+    setText("brand-title", state.title);
+    setText("brand-project", state.project);
+    setText("clock-time", state.clock);
+    setText("clock-date", state.generatedAt);
+    setText("summary-online", `${state.onlineTotal}/${state.deviceTotal} 在线 · ${state.runTotal} RUNS`);
+    setText("summary-counts", `${state.trainingTotal} training · ${state.idleTotal} idle · ${state.errorTotal} error · ${state.offlineTotal} offline`);
+    setText("count-all", state.deviceTotal);
+    setText("count-training", state.trainingTotal);
+    setText("count-idle", state.idleTotal);
+    setText("count-error", state.errorTotal);
+    setText("count-offline", state.offlineTotal);
+    setHtml("heatmap", state.heatCellsHtml);
+    setHtml("device-grid", state.cardsHtml);
+    setHtml("runs-root", state.runsHtml);
+    setText("ticker-generated", `generated ${state.generatedAt}`);
+    restoreTerms(previousTerms);
+    applyFilter(currentFilter);
+    window.scrollTo(0, previousY);
+  }
+  window.addEventListener("autodl-dashboard-state", (event) => applyState(event.detail));
+  function loadState(){
+    if (!stateSrc) return;
+    const script = document.createElement("script");
+    script.src = stateSrc + "?t=" + Date.now();
+    script.async = true;
+    script.onload = () => script.remove();
+    script.onerror = () => script.remove();
+    document.head.appendChild(script);
+  }
+  window.addEventListener("beforeunload", saveScroll);
+  window.addEventListener("pagehide", saveScroll);
+  document.querySelectorAll("[data-filter]").forEach((btn) => {
+    btn.addEventListener("click", () => applyFilter(btn.dataset.filter));
+  });
+  applyState(window.__AUTODL_DASHBOARD_STATE__);
+  const saved = JSON.parse(sessionStorage.getItem(pageKey) || "{}");
+  if (typeof saved.pageY === "number") window.scrollTo(0, saved.pageY);
+  if (refreshSeconds > 0) window.setInterval(loadState, refreshSeconds * 1000);
+})();
+EOF
+}
+
+render_dashboard_state() {
+  local fleet="$1" state_path="$2" lines="$3" generated_at title output_dir tmp_state cards_tmp runs_tmp heat_tmp
+  output_dir="$(dirname "$state_path")"
+  mkdir -p "$output_dir"
   generated_at="$(date +%Y-%m-%dT%H:%M:%S%z)"
   if [ -n "$fleet" ]; then
     [ -d "$(fleet_dir "$fleet")" ] || die "Fleet not found: $fleet"
@@ -1626,39 +1889,80 @@ render_dashboard() {
   else
     title="Current Remote"
   fi
+
+  DASHBOARD_DEVICE_TOTAL=0
+  DASHBOARD_ONLINE_TOTAL=0
+  DASHBOARD_TRAINING_TOTAL=0
+  DASHBOARD_IDLE_TOTAL=0
+  DASHBOARD_ERROR_TOTAL=0
+  DASHBOARD_OFFLINE_TOTAL=0
+  DASHBOARD_RUN_TOTAL=0
+  DASHBOARD_HEAT_CELLS=""
+
+  cards_tmp="$(mktemp "$output_dir/.dashboard-cards.XXXXXX")" || die "mktemp failed"
+  runs_tmp="$(mktemp "$output_dir/.dashboard-runs.XXXXXX")" || { rm -f "$cards_tmp"; die "mktemp failed"; }
+  heat_tmp="$(mktemp "$output_dir/.dashboard-heat.XXXXXX")" || { rm -f "$cards_tmp" "$runs_tmp"; die "mktemp failed"; }
+  dashboard_device_cards "$fleet" "$lines" > "$cards_tmp"
+  dashboard_run_tiles "$fleet" > "$runs_tmp"
+  printf '%s' "$DASHBOARD_HEAT_CELLS" > "$heat_tmp"
+
+  tmp_state="$(mktemp "$output_dir/.dashboard-state.XXXXXX")" || { rm -f "$cards_tmp" "$runs_tmp" "$heat_tmp"; die "mktemp failed"; }
   {
-    printf '<!doctype html><html><head><meta charset="utf-8"><title>AutoDL Remote Dashboard</title><style>'
-    printf 'body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;margin:24px;background:#f6f7f9;color:#172033}h1{font-size:24px}table{border-collapse:collapse;width:100%%;background:#fff;margin:16px 0;border:1px solid #d9dee7}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid #edf0f5;font-size:14px;vertical-align:top}th{background:#eef2f7}.online{color:#087f5b;font-weight:700}.offline{color:#c92a2a;font-weight:700}.muted{color:#667085;font-size:12px;margin-top:4px}code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.summary{color:#475467;margin-bottom:18px}.log-row td{background:#0f172a;color:#dbeafe;padding:0}.log-title{font-size:12px;color:#93c5fd;padding:10px 12px;border-bottom:1px solid #1e293b}.log{margin:0;padding:12px;white-space:pre-wrap;overflow:auto;max-height:360px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45}.badge{display:inline-block;border:1px solid #d0d5dd;border-radius:999px;padding:2px 8px;font-size:12px;color:#475467;background:#fff}'
+    printf '(function(){const d=(s)=>new TextDecoder().decode(Uint8Array.from(atob(s),c=>c.charCodeAt(0)));'
+    printf 'const state={'
+    printf 'generatedAt:%s,' "$(js_string "$generated_at")"
+    printf 'clock:%s,' "$(js_string "$(date +%H:%M:%S)")"
+    printf 'title:%s,' "$(js_string "$title")"
+    printf 'project:%s,' "$(js_string "$PROJECT_ROOT")"
+    printf 'deviceTotal:%s,onlineTotal:%s,trainingTotal:%s,idleTotal:%s,errorTotal:%s,offlineTotal:%s,runTotal:%s,' \
+      "$DASHBOARD_DEVICE_TOTAL" "$DASHBOARD_ONLINE_TOTAL" "$DASHBOARD_TRAINING_TOTAL" "$DASHBOARD_IDLE_TOTAL" "$DASHBOARD_ERROR_TOTAL" "$DASHBOARD_OFFLINE_TOTAL" "$DASHBOARD_RUN_TOTAL"
+    printf 'heatCellsHtml:d("%s"),' "$(base64_file_compact "$heat_tmp")"
+    printf 'cardsHtml:d("%s"),' "$(base64_file_compact "$cards_tmp")"
+    printf 'runsHtml:d("%s")' "$(base64_file_compact "$runs_tmp")"
+    printf '};window.__AUTODL_DASHBOARD_STATE__=state;window.dispatchEvent(new CustomEvent("autodl-dashboard-state",{detail:state}));})();\n'
+  } > "$tmp_state"
+  mv "$tmp_state" "$state_path"
+  rm -f "$cards_tmp" "$runs_tmp" "$heat_tmp"
+}
+
+render_dashboard() {
+  local fleet="$1" output="$2" lines="$3" refresh_seconds="${4:-}" generated_at title output_dir tmp_output state_path state_src
+  output_dir="$(dirname "$output")"
+  mkdir -p "$output_dir"
+  generated_at="$(date +%Y-%m-%dT%H:%M:%S%z)"
+  if [ -n "$fleet" ]; then
+    [ -d "$(fleet_dir "$fleet")" ] || die "Fleet not found: $fleet"
+    title="Fleet $fleet"
+  else
+    title="Current Remote"
+  fi
+  state_path="$(dashboard_state_path "$output")"
+  state_src="$(basename "$state_path")"
+  render_dashboard_state "$fleet" "$state_path" "$lines"
+
+  tmp_output="$(mktemp "$output_dir/.dashboard.XXXXXX")" || die "mktemp failed"
+  {
+    printf '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AutoDL Remote Dashboard</title><style>'
+    dashboard_css
     printf '</style>'
+    printf '</head><body><div class="app"><div class="scanlines"></div><div class="vignette"></div>'
+    printf '<header class="topbar"><div class="topbar-l"><div class="brand"><span class="brand-mark">◇</span><span class="brand-name">AUTODL</span><span class="brand-sub">MONITOR</span><span class="brand-ver">v%s</span></div><div class="brand-tagline">— <span id="brand-title">%s</span> · <span id="brand-project">%s</span> —</div></div>' "$(html_escape "$PROGRAM_VERSION")" "$(html_escape "$title")" "$(html_escape "$PROJECT_ROOT")"
+    printf '<div class="topbar-c"><div class="agg-block"><div class="agg-block-h"><span>TOTAL UTIL</span><span id="summary-online">loading</span></div><div id="heatmap" class="heatmap"></div><div id="summary-counts" class="agg-block-f">loading</div></div></div>'
+    printf '<div class="topbar-r"><div class="clock"><div id="clock-time" class="clock-t">%s</div><div id="clock-date" class="clock-d">%s</div></div><div class="refresh"><span class="dim">REFRESH</span><div class="seg">' "$(date +%H:%M:%S)" "$(html_escape "$generated_at")"
     if [ -n "$refresh_seconds" ]; then
-      printf '<meta http-equiv="refresh" content="%s">' "$(html_escape "$refresh_seconds")"
-    fi
-    printf '</head><body>'
-    printf '<h1>AutoDL Remote Dashboard</h1><div class="summary">%s · generated %s · project %s' "$(html_escape "$title")" "$(html_escape "$generated_at")" "$(html_escape "$PROJECT_ROOT")"
-    if [ -n "$refresh_seconds" ]; then
-      printf ' · <span class="badge">refresh every %ss</span>' "$(html_escape "$refresh_seconds")"
-    fi
-    printf '</div>'
-    printf '<h2>Devices</h2><table><thead><tr><th>Device</th><th>Online</th><th>Account</th><th>GPU</th><th>Disk</th><th>Current Run</th><th>Tags</th></tr></thead><tbody>'
-    if [ -n "$fleet" ]; then
-      local device_file device account remote tags
-      for device_file in "$(fleet_dir "$fleet")"/*.conf; do
-        [ -f "$device_file" ] || continue
-        device="$(device_get "$device_file" NAME)"
-        account="$(device_get "$device_file" ACCOUNT)"
-        remote="$(device_get "$device_file" REMOTE_ROOT)"
-        tags="$(device_get "$device_file" TAGS)"
-        dashboard_device_row "$device" "$account" "$remote" "$tags"
-      done
+      printf '<button class="seg-btn on">%ss</button>' "$(html_escape "$refresh_seconds")"
     else
-      dashboard_device_row "current" "$PROJECT_ACCOUNT" "$REMOTE_ROOT" "project"
+      printf '<button class="seg-btn on">manual</button>'
     fi
-    printf '</tbody></table>'
-    printf '<h2>Runs</h2><table><thead><tr><th>Run</th><th>Account</th><th>Status</th><th>Model</th><th>Stage</th><th>Started</th><th>Tags</th><th>Log / Notes</th></tr></thead><tbody>'
-    dashboard_run_rows "$fleet" "$lines"
-    printf '</tbody></table>'
-    printf '</body></html>\n'
-  } > "$output"
+    printf '</div></div></div><div class="filters"><button class="flt on" data-filter="all"><span>全部</span><span id="count-all" class="flt-c">0</span></button><button class="flt" data-filter="training"><span>训练中</span><span id="count-training" class="flt-c">0</span></button><button class="flt" data-filter="idle"><span>空闲</span><span id="count-idle" class="flt-c">0</span></button><button class="flt" data-filter="error"><span>异常</span><span id="count-error" class="flt-c">0</span></button><button class="flt" data-filter="offline"><span>离线</span><span id="count-offline" class="flt-c">0</span></button></div></header>'
+    printf '<main id="device-grid" class="grid"></main><div id="runs-root"></div>'
+    printf '<div class="ticker"><span class="ticker-tag">EVT</span><div class="ticker-row"><span id="ticker-generated">generated %s</span><span>read-only dashboard</span><span>state updates without full page reload</span></div></div>' "$(html_escape "$generated_at")"
+    printf '<script>window.__AUTODL_REFRESH_SECONDS__=%s;window.__AUTODL_STATE_SRC__=%s;</script>' "${refresh_seconds:-0}" "$(js_string "$state_src")"
+    printf '<script src="%s"></script><script>' "$(html_escape "$state_src")"
+    dashboard_js
+    printf '</script></div></body></html>\n'
+  } > "$tmp_output"
+  mv "$tmp_output" "$output"
 }
 
 cmd_dashboard() {
@@ -1684,14 +1988,16 @@ cmd_dashboard() {
   fi
   [ -z "$output" ] && output="$PROJECT_ROOT/$HISTORY_DIR/dashboard.html"
   if [ -n "$watch_seconds" ]; then
+    render_dashboard "$fleet" "$output" "$lines" "$watch_seconds"
+    info "Dashboard written: $output"
+    if [ "$open_file" = "true" ] && [ "$opened" = "false" ]; then
+      command -v open >/dev/null 2>&1 && open "$output" || info "open command not available."
+      opened=true
+    fi
     while :; do
-      render_dashboard "$fleet" "$output" "$lines" "$watch_seconds"
-      info "Dashboard written: $output"
-      if [ "$open_file" = "true" ] && [ "$opened" = "false" ]; then
-        command -v open >/dev/null 2>&1 && open "$output" || info "open command not available."
-        opened=true
-      fi
       sleep "$watch_seconds"
+      render_dashboard_state "$fleet" "$(dashboard_state_path "$output")" "$lines"
+      info "Dashboard state updated: $(dashboard_state_path "$output")"
     done
   fi
   render_dashboard "$fleet" "$output" "$lines"

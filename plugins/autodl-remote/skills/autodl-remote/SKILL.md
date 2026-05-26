@@ -17,6 +17,8 @@ Use this skill when the user wants Codex to work locally while controlling AutoD
 - Do not decide that local or remote is the source of truth globally.
 - Do not use `local-main`, `remote-main`, manifests, sparse-cache modes, or automatic code ownership rules.
 - Codex decides the smallest useful action each time: inspect, upload, download, run, or tail logs.
+- Reusable project assets must be created or edited locally first, then uploaded with `put`, `sync-up`, or `put-run` before remote execution. This includes source code, notebooks, YAML/JSON/TOML configs, prompts, templates, and files needed to reproduce an experiment. Do not create or modify these durable files directly on the remote machine with heredocs, `cat > file`, editors, or shell redirection, unless the user explicitly asks for a remote-only edit.
+- Shell commands and shell launch wrappers are normally runtime control, not durable project assets. They may be generated or executed remotely without local persistence for startup glue, environment checks, quoting-heavy commands, process supervision, and one-off experiment launches. Only save shell scripts locally when the user asks to keep them or they become a named project entrypoint.
 - Do not download LLM weights, checkpoints, datasets, or large outputs unless the user explicitly asks.
 - Prefer reading remote files/logs in place with `cat`, `tail`, `ls`, and `tree`.
 - Use detached job commands for long training runs instead of manually guessing process state.
@@ -89,6 +91,7 @@ autodl-remote shutdown
 
 - Before editing remote-existing code, inspect with `tree`, `ls`, `cat`, or `get` only the needed files.
 - Before running remote code that depends on local edits, explicitly upload the edited files or directories with `put` or `sync-up`.
+- Do not use `exec --stdin`, heredocs, `cat >`, remote editors, or remote shell redirection to create reusable project assets on the remote host. Keep durable code and configuration local-first so git and the user's local workspace remain the record. This restriction does not apply to shell commands or shell wrappers used to start, check, or supervise runs.
 - After remote execution, inspect logs remotely first; pull only small result files when useful.
 - If both local and remote have similar files, do not assume one should overwrite the other. Compare or inspect first, then choose `put` or `get`.
 - Use `exec --detach` for long training jobs and then `tail` the log path.
