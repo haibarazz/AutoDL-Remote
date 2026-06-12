@@ -39,11 +39,23 @@
 | ⬇️ 显式下载 | 用 `get` 或 `sync-down` 只拉回需要查看或提交的结果 |
 | 📜 日志查看 | 用 `tail` 查看远端训练日志，不必下载大文件 |
 | 🧾 Job 状态 | 用 `job status` 和 `job tail` 跟踪 `exec --detach --name` 创建的长任务 |
-| 📊 Dashboard | 用只读页面查看多台远端设备、run 状态和最近日志，减少聊天里反复粘贴日志 |
+| 🧵 tmux 后端 | 可选用 `exec --tmux` 让长任务保留远端终端 pane，方便 dashboard 展示现场输出 |
+| 📊 Dashboard | 用只读页面查看多台远端设备、run 状态、最近日志或 tmux pane 输出 |
 | 🧠 脚本执行 | 用 `exec --script` 或 `exec --stdin` 避免复杂 quoting |
 | ⏻ 远端关机 | 用 `shutdown` 处理 AutoDL 关机和 SSH 断开返回码 |
 | 📝 项目约定 | 首次使用自动生成 `.autodl-remote/CONVENTIONS.md` 记录远端约定 |
 | 🧩 Codex 友好 | 插件不替你判断同步策略，把决策权留给用户和 Codex |
+
+## 🆕 0.8.0 更新
+
+&emsp;&emsp;这版重点补上了多机训练时最需要的“现场感”：
+
+- 新增可选 `tmux` 后端：长任务可以用 `exec --tmux --name <run> -- ...` 跑在远端 tmux pane 里。
+- 新增 `tmux check/install/list/capture/attach-cmd/kill`，Codex 可以检查、安装、查看和结束远端 tmux 会话。
+- Dashboard 现在优先展示 tmux pane 的真实终端输出；如果 pane 不存在，再回退到日志文件。
+- `dashboard --watch` 不再整页刷新，而是轮询旁边的状态文件并增量更新页面内容，滚动体验更稳定。
+- 已用一台 GPU AutoDL 和一台 CPU AutoDL 做过双机 smoke test：分别启动 tmux 任务、打开 fleet dashboard、观察实时输出，最后用 `shutdown` 关机。
+- 新增开发脚本 `scripts/dev-install-cache.sh`，用于把当前源码直接刷新到 Codex App 本地插件 cache。
 
 ## ✅ Requirements
 
@@ -51,6 +63,7 @@
 - 本机需要 `bash`、`ssh`、`scp`。
 - 可选安装 `rsync`，目录同步会更快；没有 `rsync` 时仍可使用 `scp`。
 - 远端机器只需要能 SSH 登录，不需要安装 Codex、Python 包、OpenAI key 或额外 daemon。
+- 可选远端安装 `tmux`，仅在使用 `exec --tmux` 或 tmux pane dashboard 时需要。
 - 如果使用密码登录，macOS 上可以选择把密码保存到 Keychain，方便 Codex 非交互运行命令。
 
 ## 📦 Install
@@ -230,7 +243,7 @@ autodl-remote exec -- nvidia-smi
   <img src="./docs/images/autodl-remote-dashboard.png" alt="AutoDL Remote Dashboard 示例" width="100%">
 </div>
 
-&emsp;&emsp;Dashboard 是只读的本地页面：它通过 SSH 轮询远端状态，显示设备在线情况、GPU/磁盘信息、当前 run，以及远端日志的最近若干行。Codex 只需要启动 dashboard 命令，不需要把训练日志复制到聊天里。
+&emsp;&emsp;Dashboard 是只读的本地页面：它通过 SSH 轮询远端状态，显示设备在线情况、GPU/磁盘信息、当前 run，以及远端日志的最近若干行。对于 `exec --tmux` 启动的任务，它会优先展示 tmux pane 的当前输出；pane 不可用时再回退到日志文件。Codex 只需要启动 dashboard 命令，不需要把训练日志复制到聊天里。
 
 ```bash
 autodl-remote dashboard --fleet llm-exp --open --watch 5 --lines 120
@@ -255,6 +268,9 @@ autodl-remote dashboard --fleet llm-exp --open --watch 5 --lines 120
 | `autodl-remote exec --script scripts/check.sh` | 上传并运行本地脚本，减少 shell quoting 问题 |
 | `cat script.sh \| autodl-remote exec --stdin -- bash` | 从 stdin 上传多行脚本并运行 |
 | `autodl-remote exec --detach --name train -- python train.py` | 远端后台运行长任务 |
+| `autodl-remote tmux check` | 检查远端是否安装 tmux |
+| `autodl-remote exec --tmux --name train -- python -u train.py` | 用 tmux pane 运行长任务 |
+| `autodl-remote tmux capture train --lines 200` | 抓取 tmux pane 最近输出 |
 | `autodl-remote job list` | 列出本地记录的远端长任务 |
 | `autodl-remote job status train` | 查看长任务 PID、日志、远端状态和退出码 |
 | `autodl-remote job tail train` | 查看命名长任务日志 |
@@ -306,6 +322,20 @@ autodl-remote job status train
 autodl-remote job tail train
 autodl-remote cat -- outputs/metrics.json
 autodl-remote get outputs/metrics.json outputs/metrics.json
+```
+
+需要看远端终端现场时，使用可选 tmux 后端：
+
+```bash
+autodl-remote tmux check
+autodl-remote exec --tmux --name train-live -- PYTHONUNBUFFERED=1 python -u train.py
+autodl-remote tmux capture train-live --lines 200
+```
+
+如果远端没有 tmux，插件会提示你安装；需要 tmux 后端时运行：
+
+```bash
+autodl-remote tmux install
 ```
 
 ### 远端关机
@@ -376,6 +406,24 @@ git pull
 
 如果你通过 Codex App 安装插件，可以在插件页面使用升级或重新安装入口。
 
+本地开发时，如果你想让 Codex App 立刻使用当前 checkout 的最新插件代码，可以运行：
+
+```bash
+./scripts/dev-install-cache.sh
+```
+
+这个脚本会把 `plugins/autodl-remote` 复制到：
+
+```text
+~/.codex/plugins/cache/local-codex-plugins/autodl-remote/<version>
+```
+
+默认会清掉同一插件旧版本 cache，避免 Codex App 继续加载旧版本。需要保留旧 cache 时可用：
+
+```bash
+./scripts/dev-install-cache.sh --keep-old
+```
+
 卸载 CLI 软链接：
 
 ```bash
@@ -422,11 +470,13 @@ rm -f /opt/homebrew/bin/autodl-remote
 │   ├── bin/autodl-remote
 │   ├── config/example.conf
 │   ├── skills/autodl-remote/SKILL.md
+│   ├── skills/autodl-remote-tmux/SKILL.md
 │   └── README.md
 ├── docs/
 │   ├── design.md
 │   ├── troubleshooting.md
 │   └── images/
+├── scripts/dev-install-cache.sh
 ├── scripts/install-cli.sh
 ├── CHANGELOG.md
 ├── .gitignore

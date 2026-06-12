@@ -1,7 +1,7 @@
 {
   "name": "autodl-remote",
-  "version": "0.7.0",
-  "description": "Bash-only SSH account, fleet, command, upload, download, job, dashboard, and shutdown tool layer for AutoDL.",
+  "version": "0.8.0",
+  "description": "Bash-only SSH account, fleet, command, tmux, upload, download, job, dashboard, and shutdown tool layer for AutoDL.",
   "author": {
     "name": "haibarazz",
     "url": "https://github.com/haibarazz/AutoDL-Remote"
@@ -14,6 +14,7 @@
     "ssh",
     "remote-execution",
     "remote-jobs",
+    "tmux",
     "rsync",
     "codex"
   ],
@@ -21,7 +22,7 @@
   "interface": {
     "displayName": "AutoDL Remote",
     "shortDescription": "Control AutoDL over SSH from local Codex.",
-    "longDescription": "Provides SSH account and fleet management, remote command execution, explicit file upload/download primitives, remote job/run tracking, read-only dashboard generation, script execution, and shutdown handling. Codex decides what to inspect, push, pull, and run.",
+    "longDescription": "Provides SSH account and fleet management, remote command execution, optional tmux-backed long jobs, explicit file upload/download primitives, remote job/run tracking, read-only dashboard generation, script execution, and shutdown handling. Codex decides what to inspect, push, pull, and run.",
     "developerName": "haibarazz",
     "category": "Developer Tools",
     "capabilities": [
@@ -36,6 +37,7 @@
       "Use AutoDL Remote to inspect my remote project.",
       "Upload this edited file to AutoDL and run training.",
       "Tail the latest AutoDL training log.",
+      "Run a long AutoDL training job in tmux and show the live pane output.",
       "Check the status of my detached AutoDL job.",
       "Show a read-only dashboard for my AutoDL devices and runs.",
       "Shut down the remote AutoDL machine when the run is finished."

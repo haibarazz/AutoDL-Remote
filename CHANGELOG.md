@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0
+
+- Added optional tmux backend for long-running remote jobs with `exec --tmux --name <run> -- <command>`.
+- Added `tmux check`, `tmux install`, `tmux list`, `tmux capture`, `tmux attach-cmd`, and `tmux kill`.
+- Dashboard now prefers tmux pane output for tmux-backed jobs and falls back to recorded log files when the pane is unavailable.
+- Dashboard watch mode now updates a sidecar state file instead of forcing full-page reloads.
+- Job metadata now records backend, tmux session, and tmux socket fields.
+- Added AutoDL-specific tmux skill guidance so Codex can choose tmux for long, parallel, or multi-host work.
+- Added `scripts/dev-install-cache.sh` for local Codex App cache refresh during plugin development.
+- Smoke-tested the tmux fleet dashboard on one GPU AutoDL host and one CPU-only AutoDL host, then shut both down through `autodl-remote shutdown`.
+- Fixed first-time SSH host-key confirmation handling in keychain/expect mode and enabled `StrictHostKeyChecking=accept-new` for SSH/SCP/rsync transports.
+
 ## 0.7.0
 
 - Added project-local fleets for grouping multiple AutoDL/SSH accounts under one experiment workspace.

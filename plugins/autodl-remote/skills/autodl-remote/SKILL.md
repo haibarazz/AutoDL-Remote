@@ -22,6 +22,9 @@ Use this skill when the user wants Codex to work locally while controlling AutoD
 - Do not download LLM weights, checkpoints, datasets, or large outputs unless the user explicitly asks.
 - Prefer reading remote files/logs in place with `cat`, `tail`, `ls`, and `tree`.
 - Use detached job commands for long training runs instead of manually guessing process state.
+- For long-running, interactive, multi-run, or multi-device work, consider using the tmux backend with `autodl-remote exec --tmux --name <run> -- <command>`. Use ordinary `exec` or `exec --detach` for short non-interactive commands.
+- If tmux is useful but missing on the remote machine, do not bypass the plugin with raw SSH. Run `autodl-remote tmux check`, then install it with `autodl-remote tmux install` unless the user has explicitly forbidden remote package installation.
+- For tmux-backed jobs, prefer `autodl-remote tmux capture <name>` or the dashboard to inspect live pane output. The dashboard may show tmux pane output directly instead of only log files.
 - Use run metadata (`--model`, `--tag`, `--stage`, `--purpose`) when launching experiments so `run list` and the dashboard explain what is running.
 - Use `fleet` for multi-device projects and `dashboard` for display-only visibility. The dashboard must not be treated as an operation surface.
 - Do not start or open the dashboard by default. For single-device work, prefer `run status`, `run tail`, `job status`, or `tail` unless the user explicitly asks for a dashboard or live visual monitoring.
@@ -70,6 +73,9 @@ autodl-remote sync-down logs/train.log ./logs/train.log
 autodl-remote exec -- pwd
 autodl-remote exec -- python train.py
 autodl-remote exec --detach --name train --model baseline --stage training -- python train.py
+autodl-remote tmux check
+autodl-remote exec --tmux --name train-live --model baseline --stage training -- PYTHONUNBUFFERED=1 python -u train.py
+autodl-remote tmux capture train-live --lines 200
 autodl-remote exec --script scripts/remote_check.sh
 cat scripts/remote_check.sh | autodl-remote exec --stdin -- bash
 autodl-remote job list
@@ -95,7 +101,9 @@ autodl-remote shutdown
 - After remote execution, inspect logs remotely first; pull only small result files when useful.
 - If both local and remote have similar files, do not assume one should overwrite the other. Compare or inspect first, then choose `put` or `get`.
 - Use `exec --detach` for long training jobs and then `tail` the log path.
+- Use `exec --tmux --name <run>` when live pane visibility matters, when several experiments run in parallel, or when multiple hosts need clearer terminal-state monitoring.
 - Prefer `job status <name>` and `job tail <name>` for detached jobs created with `--name`.
+- Prefer `tmux capture <name>` for tmux-backed jobs when the user asks what the remote terminal currently shows.
 - Prefer `run list`, `run status`, `run tail`, and `run note` when the user is thinking in terms of experiments/models rather than raw jobs.
 - For multiple machines, use `fleet add/list/status` by default. Use `dashboard --fleet <name>` only after the user asks for a dashboard, overview, or live monitoring.
 - When inspecting a non-default fleet device, pass `--account` and `--remote` to `tree`, `ls`, `cat`, `tail`, `put`, `get`, and `exec` instead of rebinding the project.

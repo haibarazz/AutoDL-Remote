@@ -71,6 +71,8 @@ autodl-remote tree . --depth 2
 autodl-remote exec -- pwd
 autodl-remote exec -- python train.py
 autodl-remote exec --detach --name train --model baseline --stage training -- python train.py
+autodl-remote exec --tmux --name train-live --model baseline --stage training -- PYTHONUNBUFFERED=1 python -u train.py
+autodl-remote tmux capture train-live --lines 200
 autodl-remote run status train
 autodl-remote run tail train
 autodl-remote dashboard
@@ -101,7 +103,9 @@ autodl-remote shutdown
 
 ## Fleet and Dashboard
 
-The dashboard is read-only. It shows local run metadata, lightweight remote status from SSH polling, and the latest remote log lines for recorded runs. It does not stop jobs, delete files, upload, download, or shut down machines.
+The dashboard is read-only. It shows local run metadata, lightweight remote status from SSH polling, and the latest remote log lines or tmux pane output for recorded runs. It does not stop jobs, delete files, upload, download, or shut down machines.
+
+When `--watch` is enabled, the CLI keeps updating a sidecar `dashboard.state.js` file. The browser polls that file and updates the page in place, so the dashboard can keep scroll position and avoid full-page reloads.
 
 ![AutoDL Remote Dashboard](../../docs/images/autodl-remote-dashboard.png)
 
@@ -152,6 +156,33 @@ Useful log markers:
 [DONE] exit_code=0
 [ERROR] ...
 ```
+
+## tmux Backend
+
+`tmux` is optional. Normal SSH commands and `exec --detach` still work without it.
+
+Use tmux when you want a long-running remote job to keep a live terminal pane:
+
+```bash
+autodl-remote tmux check
+autodl-remote exec --tmux --name train-live --model baseline --stage training -- \
+  PYTHONUNBUFFERED=1 python -u train.py
+autodl-remote tmux capture train-live --lines 200
+```
+
+If the remote machine does not have tmux, the plugin will say so explicitly:
+
+```bash
+Remote tmux is missing. Please install tmux on the remote machine, or run: autodl-remote tmux install
+```
+
+Install tmux only when you actually want this backend:
+
+```bash
+autodl-remote tmux install
+```
+
+The dashboard reads tmux pane output for tmux-backed jobs and falls back to the recorded log file if the pane is gone.
 
 ## Accounts
 
@@ -212,8 +243,14 @@ autodl-remote fleet add <fleet> <device> [--account name] [--remote path] [--tag
 autodl-remote fleet list
 autodl-remote fleet status [fleet]
 autodl-remote dashboard [--fleet name] [--output path] [--open] [--watch seconds] [--lines 120]
+autodl-remote tmux check [--account name] [--remote path]
+autodl-remote tmux install [--account name] [--remote path]
+autodl-remote tmux list [--account name] [--remote path]
+autodl-remote tmux capture [--account name] [--remote path] [--lines 120] <session>
+autodl-remote tmux attach-cmd [--account name] [--remote path] <session>
+autodl-remote tmux kill [--account name] [--remote path] <session>
 
-autodl-remote exec [--account name] [--remote path] [--detach] [--cwd path] [--name name] [--model name] [--tag k=v] [--stage stage] [--purpose text] [--script local_script] [--stdin] -- <command>
+autodl-remote exec [--account name] [--remote path] [--detach|--tmux] [--cwd path] [--name name] [--model name] [--tag k=v] [--stage stage] [--purpose text] [--script local_script] [--stdin] -- <command>
 autodl-remote put-run <local-path>... -- <command>
 autodl-remote put [--account name] [--remote path] <local-path> [remote-path]
 autodl-remote get [--account name] [--remote path] <remote-path> [local-path]
@@ -247,6 +284,7 @@ autodl-remote history
 - Keep large models, datasets, checkpoints, and training outputs on AutoDL unless the user explicitly pulls them.
 - Use `exec --script` or `exec --stdin` for multi-line shell/Python snippets.
 - Use `job status` and `job tail` for detached training jobs created with `exec --detach --name`.
+- Use `exec --tmux --name` when live pane output matters, especially for long tasks, parallel runs, or multiple hosts.
 - Use `fleet` and `dashboard` for multi-device visibility; the dashboard is display-only.
 - Use `dashboard --watch <seconds> --lines <n>` when the user wants to watch remote logs without spending chat tokens.
 - Use run metadata flags (`--model`, `--tag`, `--stage`, `--purpose`) when Codex launches experiments so later dashboards are understandable.

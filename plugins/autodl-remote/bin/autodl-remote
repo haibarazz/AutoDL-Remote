@@ -2,7 +2,7 @@
 set -u
 
 PROGRAM="autodl-remote"
-PROGRAM_VERSION="0.7.0"
+PROGRAM_VERSION="0.8.0"
 APP_DIR="$HOME/.autodl-remote"
 ACCOUNTS_DIR="$APP_DIR/accounts"
 DEFAULT_ACCOUNT_FILE="$APP_DIR/default-account"
@@ -45,9 +45,15 @@ project:
   fleet list
   fleet status [fleet]
   dashboard [--fleet name] [--output path] [--open] [--watch seconds] [--lines 120]
+  tmux check [--account name] [--remote path]
+  tmux install [--account name] [--remote path]
+  tmux list [--account name] [--remote path]
+  tmux capture [--account name] [--remote path] [--lines 120] <session>
+  tmux attach-cmd [--account name] [--remote path] <session>
+  tmux kill [--account name] [--remote path] <session>
 
 remote:
-  exec [--account name] [--remote path] [--detach] [--cwd path] [--name name] [--model name] [--tag k=v] [--stage stage] [--purpose text] [--script local_script] [--stdin] [--allow-dangerous] -- <command>
+  exec [--account name] [--remote path] [--detach|--tmux] [--cwd path] [--name name] [--model name] [--tag k=v] [--stage stage] [--purpose text] [--script local_script] [--stdin] [--allow-dangerous] -- <command>
   put-run <local-path>... -- <command>
   put [--account name] [--remote path] <local-path> [remote-path]
   get [--account name] [--remote path] <remote-path> [local-path]
@@ -230,6 +236,10 @@ This file is created locally by \`autodl-remote\` to record project-specific rem
 - Do not download models, datasets, checkpoints, or large outputs unless explicitly asked.
 - Prefer remote \`cat\`, \`tail\`, \`ls\`, and \`tree\` before downloading files.
 
+## Remote Execution
+
+- Long task backend: normal detach by default; use \`tmux\` when live pane monitoring or multiple parallel runs are useful.
+
 ## Notes
 
 - Add project-specific notes here.
@@ -247,7 +257,7 @@ job_path() {
 }
 
 write_job() {
-  local name="$1" pid="$2" log="$3" status_path="$4" cwd="$5" command="$6" model="${7:-}" tags="${8:-}" purpose="${9:-}" stage="${10:-}" outputs="${11:-}" file
+  local name="$1" pid="$2" log="$3" status_path="$4" cwd="$5" command="$6" model="${7:-}" tags="${8:-}" purpose="${9:-}" stage="${10:-}" outputs="${11:-}" backend="${12:-detach}" tmux_session="${13:-}" tmux_socket="${14:-}" file
   mkdir -p "$(jobs_dir)"
   file="$(job_path "$name")"
   cat > "$file" <<EOF
@@ -265,6 +275,9 @@ TAGS="$(config_quote "$tags")"
 PURPOSE="$(config_quote "$purpose")"
 STAGE="$(config_quote "$stage")"
 OUTPUTS="$(config_quote "$outputs")"
+BACKEND="$(config_quote "$backend")"
+TMUX_SESSION="$(config_quote "$tmux_session")"
+TMUX_SOCKET="$(config_quote "$tmux_socket")"
 EOF
 }
 
@@ -446,7 +459,7 @@ load_project() {
 ssh_common_args() {
   local control_path
   control_path="$(ssh_control_path)"
-  SSH_ARGS=(-p "$ACCOUNT_PORT" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPersist=600 -o "ControlPath=$control_path")
+  SSH_ARGS=(-p "$ACCOUNT_PORT" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o ControlMaster=auto -o ControlPersist=600 -o "ControlPath=$control_path")
   [ -n "$ACCOUNT_KEY" ] && SSH_ARGS+=(-i "$ACCOUNT_KEY")
   if [ "$ACCOUNT_AUTH" != "keychain" ] && [ "$ACCOUNT_AUTH" != "prompt" ]; then
     SSH_ARGS+=(-o BatchMode=yes)
@@ -456,7 +469,7 @@ ssh_common_args() {
 scp_common_args() {
   local control_path
   control_path="$(ssh_control_path)"
-  SCP_ARGS=(-P "$ACCOUNT_PORT" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPersist=600 -o "ControlPath=$control_path")
+  SCP_ARGS=(-P "$ACCOUNT_PORT" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o ControlMaster=auto -o ControlPersist=600 -o "ControlPath=$control_path")
   [ -n "$ACCOUNT_KEY" ] && SCP_ARGS+=(-i "$ACCOUNT_KEY")
   if [ "$ACCOUNT_AUTH" != "keychain" ] && [ "$ACCOUNT_AUTH" != "prompt" ]; then
     SCP_ARGS+=(-o BatchMode=yes)
@@ -466,7 +479,7 @@ scp_common_args() {
 rsync_ssh_command() {
   local cmd control_path
   control_path="$(ssh_control_path)"
-  cmd="ssh -p $(shell_quote "$ACCOUNT_PORT") -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPersist=600 -o ControlPath=$(shell_quote "$control_path")"
+  cmd="ssh -p $(shell_quote "$ACCOUNT_PORT") -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o ControlMaster=auto -o ControlPersist=600 -o ControlPath=$(shell_quote "$control_path")"
   [ -n "$ACCOUNT_KEY" ] && cmd="$cmd -i $(shell_quote "$ACCOUNT_KEY")"
   if [ "$ACCOUNT_AUTH" != "keychain" ] && [ "$ACCOUNT_AUTH" != "prompt" ]; then
     cmd="$cmd -o BatchMode=yes"
@@ -498,13 +511,19 @@ expect_with_password() {
   AUTODL_REMOTE_PASSWORD="$password" expect -f /dev/stdin "$@" <<'EXPECT'
     set timeout -1
     set password $env(AUTODL_REMOTE_PASSWORD)
+    log_user 0
     spawn {*}$argv
+    log_user 1
     expect {
-      -re "(?i)are you sure you want to continue connecting" {
+      -nocase -re "are you sure.*continue connecting" {
         send "yes\r"
         exp_continue
       }
-      -re "(?i)password:" {
+      -nocase -re "yes/no" {
+        send "yes\r"
+        exp_continue
+      }
+      -nocase -re "password:" {
         send "$password\r"
         exp_continue
       }
@@ -534,7 +553,8 @@ ssh_run() {
 ssh_capture() {
   local command="$1"
   ssh_common_args
-  run_transport ssh "${SSH_ARGS[@]}" "$ACCOUNT_TARGET" "$command"
+  run_transport ssh "${SSH_ARGS[@]}" "$ACCOUNT_TARGET" "$command" | tr -d '\r'
+  return "${PIPESTATUS[0]}"
 }
 
 remote_join() {
@@ -609,6 +629,24 @@ upload_file_via_ssh() {
   local local_path="$1" remote_path="$2"
   [ -f "$local_path" ] || die "Local script does not exist or is not a file: $local_path"
   upload_stdin_to_remote "$remote_path" < "$local_path"
+}
+
+tmux_socket_path() {
+  printf '%s/.autodl-remote/tmux/autodl.sock\n' "$REMOTE_ROOT"
+}
+
+tmux_missing_text() {
+  printf 'Remote tmux is missing. Please install tmux on the remote machine, or run: autodl-remote tmux install\n'
+}
+
+remote_tmux_capture() {
+  local session="$1" socket="$2" lines="$3" output rc
+  [ -n "$session" ] || { printf '[tmux session missing]\n'; return 1; }
+  [ -n "$socket" ] || socket="$(tmux_socket_path)"
+  output="$(ssh_capture "if ! command -v tmux >/dev/null 2>&1; then printf '%s\n' $(shell_quote "$(tmux_missing_text)"); exit 127; fi; if tmux -S $(shell_quote "$socket") has-session -t $(shell_quote "$session") 2>/dev/null; then tmux -S $(shell_quote "$socket") capture-pane -p -J -t $(shell_quote "$session:0.0") -S -$lines; else printf '[tmux session missing] %s\n' $(shell_quote "$session"); exit 42; fi" 2>&1)"
+  rc=$?
+  printf '%s\n' "$output"
+  return "$rc"
 }
 
 strip_token_quotes() {
@@ -936,18 +974,19 @@ cmd_doctor() {
   info "Remote root: $REMOTE_ROOT"
   info "Local ssh: $(command -v ssh || echo MISSING)"
   info "Local rsync: $(command -v rsync || echo MISSING)"
-  ssh_capture "printf 'host=' && hostname && printf 'pwd=' && pwd && printf 'remote_root=' && { test -d $(shell_quote "$REMOTE_ROOT") && echo exists || echo missing; } && printf 'rsync=' && { command -v rsync || true; } && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true"
+  ssh_capture "printf 'host=' && hostname && printf 'pwd=' && pwd && printf 'remote_root=' && { test -d $(shell_quote "$REMOTE_ROOT") && echo exists || echo missing; } && printf 'rsync=' && { command -v rsync || true; } && printf 'tmux=' && { command -v tmux || echo missing; } && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true"
 }
 
 cmd_exec() {
   load_project
-  local detach=false cwd="" cwd_arg="" name="" allow_dangerous=false script="" stdin_mode=false remote_script=""
+  local detach=false tmux_mode=false cwd="" cwd_arg="" name="" allow_dangerous=false script="" stdin_mode=false remote_script=""
   local account_override="" remote_override="" model="" tags="" purpose="" stage="" outputs=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --account) account_override="$2"; shift 2 ;;
       --remote) remote_override="$2"; shift 2 ;;
       --detach) detach=true; shift ;;
+      --tmux) tmux_mode=true; detach=true; shift ;;
       --cwd) cwd_arg="$2"; shift 2 ;;
       --name) name="$2"; shift 2 ;;
       --model) model="$2"; shift 2 ;;
@@ -967,7 +1006,7 @@ cmd_exec() {
   cwd="$REMOTE_ROOT"
   [ -z "$cwd_arg" ] || cwd="$(remote_join "$cwd_arg")"
 
-  local cmd="" tmp_name result pid status_path remote_cmd detach_rc
+  local cmd="" tmp_name result pid status_path remote_cmd detach_rc backend="detach" tmux_session="" tmux_socket=""
   if [ -n "$script" ]; then
     local local_script
     local_script="$(local_join "$script")"
@@ -1020,23 +1059,89 @@ set +e
 started_at=\$(date +%Y-%m-%dT%H:%M:%S%z)
 pid=\$BASHPID
 printf 'status=running\npid=%s\nstarted_at=%s\nlog=%s\ncwd=%s\n' "\$pid" "\$started_at" $(shell_quote "$log") $(shell_quote "$cwd") > $(shell_quote "$status_path")
-cd $(shell_quote "$cwd") && bash -lc $(shell_quote "$cmd") > $(shell_quote "$log") 2>&1
-rc=\$?
+if [ "\${AUTODL_REMOTE_TMUX:-}" = "1" ]; then
+  cd $(shell_quote "$cwd") && bash -lc $(shell_quote "$cmd") 2>&1 | tee $(shell_quote "$log")
+  rc=\${PIPESTATUS[0]}
+else
+  cd $(shell_quote "$cwd") && bash -lc $(shell_quote "$cmd") > $(shell_quote "$log") 2>&1
+  rc=\$?
+fi
 finished_at=\$(date +%Y-%m-%dT%H:%M:%S%z)
 printf 'status=exited\npid=%s\nstarted_at=%s\nfinished_at=%s\nexit_code=%s\nlog=%s\ncwd=%s\n' "\$pid" "\$started_at" "\$finished_at" "\$rc" $(shell_quote "$log") $(shell_quote "$cwd") > $(shell_quote "$status_path")
 exit "\$rc"
 EOF
     upload_local_file "$runner_local" "$runner" || { rm -f "$runner_local"; return 1; }
     rm -f "$runner_local"
-    remote_cmd="mkdir -p $(shell_quote "$(dirname "$log")") $(shell_quote "$(dirname "$status_path")") && chmod +x $(shell_quote "$runner") && if command -v setsid >/dev/null 2>&1; then setsid bash $(shell_quote "$runner") < /dev/null > /dev/null 2>&1 & else nohup bash $(shell_quote "$runner") < /dev/null > /dev/null 2>&1 & fi; printf 'pid=%s\nlog=%s\nstatus=%s\n' \"\$!\" $(shell_quote "$log") $(shell_quote "$status_path")"
+    if [ "$tmux_mode" = "true" ]; then
+      local launcher launcher_local pane pane_local
+      backend="tmux"
+      tmux_session="$name"
+      tmux_socket="$(tmux_socket_path)"
+      pane="$REMOTE_ROOT/.autodl-remote/tmp/$name.tmux-pane.sh"
+      pane_local="$(mktemp "${TMPDIR:-/tmp}/autodl-remote-tmux-pane.XXXXXX")" || die "mktemp failed"
+      cat > "$pane_local" <<EOF
+#!/usr/bin/env bash
+export AUTODL_REMOTE_TMUX=1
+runner=$(shell_quote "$runner")
+bash "\$runner"
+rc=\$?
+printf "\\n[autodl-remote] runner exited with %s\\n" "\$rc"
+exec bash --noprofile --norc
+EOF
+      upload_local_file "$pane_local" "$pane" || { rm -f "$pane_local"; return 1; }
+      rm -f "$pane_local"
+      launcher="$REMOTE_ROOT/.autodl-remote/tmp/$name.tmux-launcher.sh"
+      launcher_local="$(mktemp "${TMPDIR:-/tmp}/autodl-remote-tmux-launcher.XXXXXX")" || die "mktemp failed"
+      cat > "$launcher_local" <<EOF
+#!/usr/bin/env bash
+set -e
+socket=$(shell_quote "$tmux_socket")
+session=$(shell_quote "$tmux_session")
+runner=$(shell_quote "$runner")
+pane=$(shell_quote "$pane")
+log=$(shell_quote "$log")
+status_path=$(shell_quote "$status_path")
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux=missing"
+  echo "$(tmux_missing_text)" >&2
+  exit 127
+fi
+mkdir -p "\$(dirname "\$socket")" "\$(dirname "\$log")" "\$(dirname "\$status_path")"
+chmod +x "\$runner" "\$pane"
+if tmux -S "\$socket" has-session -t "\$session" 2>/dev/null; then
+  echo "tmux_session_exists=\$session" >&2
+  exit 3
+fi
+printf -v pane_q '%q' "\$pane"
+tmux -S "\$socket" new-session -d -s "\$session" "bash \$pane_q"
+pane_pid="\$(tmux -S "\$socket" list-panes -t "\$session:0.0" -F '#{pane_pid}' 2>/dev/null | head -n 1 || true)"
+runner_pid=""
+for _ in 1 2 3 4 5; do
+  if [ -f "\$status_path" ]; then
+    runner_pid="\$(awk -F= '\$1=="pid"{print \$2; exit}' "\$status_path")"
+    [ -n "\$runner_pid" ] && break
+  fi
+  sleep 0.2
+done
+[ -n "\$runner_pid" ] || runner_pid="\$pane_pid"
+printf 'pid=%s\nlog=%s\nstatus=%s\ntmux_session=%s\ntmux_socket=%s\n' "\$runner_pid" "\$log" "\$status_path" "\$session" "\$socket"
+EOF
+      upload_local_file "$launcher_local" "$launcher" || { rm -f "$launcher_local"; return 1; }
+      rm -f "$launcher_local"
+      remote_cmd="bash $(shell_quote "$launcher")"
+    else
+      remote_cmd="mkdir -p $(shell_quote "$(dirname "$log")") $(shell_quote "$(dirname "$status_path")") && chmod +x $(shell_quote "$runner") && if command -v setsid >/dev/null 2>&1; then setsid bash $(shell_quote "$runner") < /dev/null > /dev/null 2>&1 & else nohup bash $(shell_quote "$runner") < /dev/null > /dev/null 2>&1 & fi; printf 'pid=%s\nlog=%s\nstatus=%s\n' \"\$!\" $(shell_quote "$log") $(shell_quote "$status_path")"
+    fi
     result="$(ssh_capture "bash -lc $(shell_quote "$remote_cmd")" 2>&1)"
     detach_rc=$?
     printf '%s\n' "$result"
     [ "$detach_rc" -eq 0 ] || return "$detach_rc"
     pid="$(printf '%s\n' "$result" | awk -F= '$1=="pid"{print $2; exit}')"
+    tmux_session="$(printf '%s\n' "$result" | awk -F= '$1=="tmux_session"{print $2; exit}')"
+    tmux_socket="$(printf '%s\n' "$result" | awk -F= '$1=="tmux_socket"{print $2; exit}')"
     [ -n "$pid" ] || die "Remote detach did not return a pid."
-    write_job "$name" "$pid" "$log" "$status_path" "$cwd" "$cmd" "$model" "$tags" "$purpose" "$stage" "$outputs"
-    write_history exec-detach "$cmd log=$log"
+    write_job "$name" "$pid" "$log" "$status_path" "$cwd" "$cmd" "$model" "$tags" "$purpose" "$stage" "$outputs" "$backend" "$tmux_session" "$tmux_socket"
+    write_history "exec-$backend" "$cmd log=$log"
   else
     local inner rc
     inner="set -o pipefail; ( $cmd ) 2>&1 | tee $(shell_quote "$log"); exit \${PIPESTATUS[0]}"
@@ -1214,19 +1319,20 @@ cmd_tail() {
 
 cmd_job_list() {
   load_project
-  local dir file name pid started log command seen=false
+  local dir file name pid started log command backend seen=false
   dir="$(jobs_dir)"
   mkdir -p "$dir"
   if ls "$dir"/*.conf >/dev/null 2>&1; then
-    printf '%-24s %-10s %-24s %s\n' "name" "pid" "started_at" "log"
+    printf '%-24s %-10s %-10s %-24s %s\n' "name" "pid" "backend" "started_at" "log"
     for file in "$dir"/*.conf; do
       seen=true
       name="$(job_get "$file" NAME)"
       pid="$(job_get "$file" PID)"
+      backend="$(job_get "$file" BACKEND)"
       started="$(job_get "$file" STARTED_AT)"
       log="$(job_get "$file" LOG_PATH)"
       command="$(job_get "$file" COMMAND)"
-      printf '%-24s %-10s %-24s %s\n' "$name" "$pid" "$started" "$log"
+      printf '%-24s %-10s %-10s %-24s %s\n' "$name" "$pid" "${backend:-detach}" "$started" "$log"
       [ -n "$command" ] && printf '  command: %s\n' "$command"
     done
   fi
@@ -1236,7 +1342,7 @@ cmd_job_list() {
 cmd_job_status() {
   load_project
   [ $# -gt 0 ] || die "job status requires a name"
-  local name file pid log status_path cwd command remote_status rc
+  local name file pid log status_path cwd command backend tmux_session tmux_socket remote_status rc
   name="$(sanitize_name "$1")"
   file="$(job_path "$name")"
   [ -f "$file" ] || die "Job not found: $name"
@@ -1245,6 +1351,9 @@ cmd_job_status() {
   status_path="$(job_get "$file" STATUS_PATH)"
   cwd="$(job_get "$file" CWD)"
   command="$(job_get "$file" COMMAND)"
+  backend="$(job_get "$file" BACKEND)"
+  tmux_session="$(job_get "$file" TMUX_SESSION)"
+  tmux_socket="$(job_get "$file" TMUX_SOCKET)"
   [ -n "$pid" ] || die "Job has no recorded pid: $name"
   apply_job_context "$file"
 
@@ -1252,6 +1361,9 @@ cmd_job_status() {
   info "account=$ACCOUNT_NAME"
   info "remote_root=$REMOTE_ROOT"
   info "pid=$pid"
+  info "backend=${backend:-detach}"
+  [ -z "$tmux_session" ] || info "tmux_session=$tmux_session"
+  [ -z "$tmux_socket" ] || info "tmux_socket=$tmux_socket"
   info "cwd=$cwd"
   info "log=$log"
   info "status_path=$status_path"
@@ -1279,12 +1391,19 @@ cmd_job_tail() {
     esac
   done
   [ $# -gt 0 ] || die "job tail requires a name"
-  local name file log flag=""
+  local name file log backend tmux_session tmux_socket flag=""
   name="$(sanitize_name "$1")"
   file="$(job_path "$name")"
   [ -f "$file" ] || die "Job not found: $name"
   log="$(job_get "$file" LOG_PATH)"
+  backend="$(job_get "$file" BACKEND)"
+  tmux_session="$(job_get "$file" TMUX_SESSION)"
+  tmux_socket="$(job_get "$file" TMUX_SOCKET)"
   apply_job_context "$file"
+  if [ "${backend:-detach}" = "tmux" ] && [ "$follow" != "true" ]; then
+    remote_tmux_capture "$tmux_session" "$tmux_socket" "$lines" && return 0
+    info "tmux capture failed; falling back to log tail."
+  fi
   [ "$follow" = "true" ] && flag="-f"
   ssh_run "tail -n $lines $flag $(shell_quote "$log")"
 }
@@ -1363,23 +1482,30 @@ cmd_run_note() {
 }
 
 cmd_run_submit() {
-  local args=(--detach) uploads=() account_override="" remote_override=""
+  local args=(--detach) uploads=() account_override="" remote_override="" upload_count=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --account) account_override="$2"; args+=("$1" "$2"); shift 2 ;;
       --remote) remote_override="$2"; args+=("$1" "$2"); shift 2 ;;
-      --sync-up) uploads+=("$2"); shift 2 ;;
+      --sync-up) uploads[$upload_count]="$2"; upload_count=$((upload_count + 1)); shift 2 ;;
       --) shift; break ;;
       *) args+=("$1"); shift ;;
     esac
   done
   [ $# -gt 0 ] || die "run submit requires a command after --"
-  local path
-  for path in "${uploads[@]}"; do
-    local put_args=()
-    [ -z "$account_override" ] || put_args+=(--account "$account_override")
-    [ -z "$remote_override" ] || put_args+=(--remote "$remote_override")
-    cmd_put "${put_args[@]}" "$path"
+  local path upload_index=0
+  while [ "$upload_index" -lt "$upload_count" ]; do
+    path="${uploads[$upload_index]}"
+    if [ -n "$account_override" ] && [ -n "$remote_override" ]; then
+      cmd_put --account "$account_override" --remote "$remote_override" "$path"
+    elif [ -n "$account_override" ]; then
+      cmd_put --account "$account_override" "$path"
+    elif [ -n "$remote_override" ]; then
+      cmd_put --remote "$remote_override" "$path"
+    else
+      cmd_put "$path"
+    fi
+    upload_index=$((upload_index + 1))
   done
   cmd_exec "${args[@]}" -- "$@"
 }
@@ -1549,6 +1675,28 @@ remote_log_tail() {
   fi
 }
 
+remote_job_tail() {
+  local account="$1" remote="$2" file="$3" lines="$4"
+  local backend log session socket output rc
+  backend="$(job_get "$file" BACKEND)"
+  log="$(job_get "$file" LOG_PATH)"
+  session="$(job_get "$file" TMUX_SESSION)"
+  socket="$(job_get "$file" TMUX_SOCKET)"
+  if [ "${backend:-detach}" = "tmux" ]; then
+    load_account "$account"
+    REMOTE_ROOT="${remote%/}"
+    validate_remote_root "$REMOTE_ROOT"
+    output="$(remote_tmux_capture "$session" "$socket" "$lines" 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    printf '[tmux pane unavailable; falling back to log]\n%s\n\n' "$output"
+  fi
+  remote_log_tail "$account" "$remote" "$log" "$lines"
+}
+
 dashboard_pct() {
   local pct
   pct="$(printf '%s\n' "$1" | awk 'match($0, /[0-9]+%/) { print substr($0, RSTART, RLENGTH - 1); exit }')"
@@ -1641,7 +1789,7 @@ latest_job_file_for_device() {
 dashboard_device_card() {
   local device="$1" account="$2" remote="$3" tags="$4" lines="$5"
   local probe online host gpu disk processes current_file current status status_class status_label
-  local gpu_util gpu_model gpu_mem disk_pct log log_tail model stage purpose started card_id
+  local gpu_util gpu_model gpu_mem disk_pct log log_tail model stage purpose started card_id backend term_source
 
   DASHBOARD_DEVICE_TOTAL=$((DASHBOARD_DEVICE_TOTAL + 1))
   load_account "$account"
@@ -1662,18 +1810,23 @@ dashboard_device_card() {
   stage="-"
   purpose=""
   started="-"
+  backend="detach"
+  term_source="processes"
   if [ -n "$current_file" ]; then
     current="$(job_get "$current_file" NAME)"
     status="$(job_remote_status_summary "$current_file")"
     log="$(job_get "$current_file" LOG_PATH)"
+    backend="$(job_get "$current_file" BACKEND)"
     model="$(job_get "$current_file" MODEL)"
     stage="$(job_get "$current_file" STAGE)"
     purpose="$(job_get "$current_file" PURPOSE)"
     started="$(job_get "$current_file" STARTED_AT)"
+    term_source="$log"
+    [ "${backend:-detach}" != "tmux" ] || term_source="tmux:$(job_get "$current_file" TMUX_SESSION)"
     [ -n "$model" ] || model="-"
     [ -n "$stage" ] || stage="-"
     if [ "$lines" -gt 0 ]; then
-      log_tail="$(remote_log_tail "$account" "$REMOTE_ROOT" "$log" "$lines")"
+      log_tail="$(remote_job_tail "$account" "$REMOTE_ROOT" "$current_file" "$lines")"
     else
       log_tail="[log hidden: --lines 0]"
     fi
@@ -1712,7 +1865,7 @@ dashboard_device_card() {
   [ -n "$purpose" ] && printf '<div class="task-purpose">%s</div>' "$(html_escape "$purpose")"
   printf '</div>\n'
   printf '<div class="mc-term"><div class="term-bar"><span class="term-dot"></span><span class="term-bar-t">%s</span><span class="term-bar-eta">last %s</span></div><pre class="term-body" data-term-id="%s">%s</pre></div>\n' \
-    "$(html_escape "${log:-processes}")" "$(html_escape "$lines")" "$(html_escape "$card_id")" "$(html_escape "$log_tail")"
+    "$(html_escape "$term_source")" "$(html_escape "$lines")" "$(html_escape "$card_id")" "$(html_escape "$log_tail")"
   printf '</article>\n'
 }
 
@@ -1785,6 +1938,9 @@ dashboard_css() {
   cat <<'EOF'
 :root{--bg:#fdf6e3;--bg-2:#f3ead0;--card:#fffbef;--card-2:#f7efd5;--border:#e1d6a8;--border-2:#cdc295;--border-soft:#ebe1b8;--fg:#073642;--fg-dim:#586e75;--dim:#93a1a1;--muted:#93a1a1;--muted-strong:#657b83;--ok:#859900;--hot:#dc322f;--warm:#b58900;--cool:#268bd2;--err:#dc322f;--off:#93a1a1;--off-bg:#e1d6a8;--term-bg:#002b36;--term-fg:#93a1a1}*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--fg)}body{font-family:"JetBrains Mono","IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;-webkit-font-smoothing:antialiased;overflow-x:hidden}.app{min-height:100vh;background:radial-gradient(ellipse 1200px 600px at 50% -200px,rgba(133,153,0,.09),transparent 70%),linear-gradient(var(--bg),var(--bg-2));display:flex;flex-direction:column}.scanlines{position:fixed;inset:0;pointer-events:none;z-index:50;background-image:repeating-linear-gradient(to bottom,rgba(0,0,0,0) 0,rgba(0,0,0,0) 2px,rgba(0,0,0,.025) 3px,rgba(0,0,0,0) 4px);mix-blend-mode:multiply}.vignette{position:fixed;inset:0;pointer-events:none;z-index:49;box-shadow:inset 0 0 180px rgba(0,0,0,.08)}.topbar{position:sticky;top:0;z-index:30;background:rgba(253,246,227,.88);backdrop-filter:blur(10px) saturate(150%);border-bottom:1px solid var(--border);padding:14px 22px 0;display:grid;grid-template-columns:minmax(280px,1fr) minmax(420px,1.4fr) minmax(260px,1fr);grid-template-rows:auto auto;grid-template-areas:"l c r" "f f f";gap:16px 24px;align-items:center}.topbar-l{grid-area:l;display:flex;flex-direction:column;gap:6px}.topbar-c{grid-area:c;display:flex;justify-content:center}.topbar-r{grid-area:r;display:flex;justify-content:flex-end;align-items:center;gap:20px}.filters{grid-area:f;display:flex;gap:8px;padding:10px 0;border-top:1px dashed var(--border-2);align-items:center}.brand{display:flex;align-items:center;gap:10px}.brand-mark{width:22px;height:22px;display:inline-grid;place-items:center;background:var(--ok);color:var(--bg);font-size:14px;border-radius:3px;box-shadow:0 0 12px rgba(133,153,0,.38)}.brand-name{font-size:17px;font-weight:700;letter-spacing:.14em}.brand-sub{font-size:11px;font-weight:600;letter-spacing:.22em;color:var(--fg-dim);padding:2px 6px;border:1px solid var(--border);border-radius:2px}.brand-ver{font-size:10px;color:var(--muted);margin-left:4px}.brand-tagline{font-size:11px;color:var(--fg-dim);letter-spacing:.02em}.agg-block{width:100%;max-width:560px;border:1px solid var(--border);background:var(--card);padding:8px 12px 9px;border-radius:4px}.agg-block-h{display:flex;justify-content:space-between;font-size:10.5px;letter-spacing:.12em;margin-bottom:6px}.heatmap{display:flex;gap:2px;height:16px;margin-bottom:6px}.heat-cell{display:block;flex:1;border-radius:1px;background:var(--off-bg);opacity:.65}.heat-training{background:var(--ok);opacity:.9}.heat-idle{background:var(--cool);opacity:.45}.heat-error{background:var(--err);opacity:.85}.heat-offline{background:var(--off-bg);opacity:.7}.agg-block-f{font-size:10.5px;letter-spacing:.04em;color:var(--dim)}.clock{text-align:right}.clock-t{font-size:22px;font-weight:600;letter-spacing:.06em;font-variant-numeric:tabular-nums}.clock-d{font-size:10.5px;letter-spacing:.08em;margin-top:2px;color:var(--dim)}.refresh{display:flex;flex-direction:column;gap:4px;align-items:flex-end}.refresh>.dim{font-size:10px;letter-spacing:.14em;color:var(--dim)}.seg{display:flex;border:1px solid var(--border);border-radius:3px;overflow:hidden}.seg-btn{appearance:none;background:transparent;border:0;padding:4px 10px;color:var(--fg-dim);font:inherit;font-size:11px;border-right:1px solid var(--border);font-variant-numeric:tabular-nums}.seg-btn:last-child{border-right:0}.seg-btn.on{color:var(--bg);background:var(--ok)}.flt{appearance:none;background:transparent;border:1px solid var(--border);color:var(--fg-dim);font:inherit;font-size:11px;padding:5px 12px;cursor:pointer;border-radius:3px;display:inline-flex;align-items:center;gap:8px;letter-spacing:.02em}.flt-c{color:var(--muted);font-variant-numeric:tabular-nums;font-size:10px}.flt:hover{color:var(--fg);border-color:var(--fg-dim)}.flt.on{color:var(--bg);background:var(--ok);border-color:var(--ok)}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:14px;padding:18px 22px 26px;flex:1}.mc{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:14px 14px 0;display:flex;flex-direction:column;gap:12px;position:relative;overflow:hidden}.mc::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--accent,var(--ok));opacity:.85}.mc-training{--accent:var(--ok)}.mc-idle{--accent:var(--cool)}.mc-error{--accent:var(--err);background:linear-gradient(180deg,rgba(220,50,47,.06),var(--card))}.mc-offline{--accent:var(--off);opacity:.72}.mc-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.mc-head-l{display:flex;flex-direction:column;gap:3px;min-width:0}.mc-head-r{display:flex;flex-direction:column;align-items:flex-end;gap:4px}.mc-id{font-size:10.5px;color:var(--dim);letter-spacing:.06em}.mc-bracket{color:var(--muted-strong)}.mc-id-text{color:var(--fg-dim);padding:0 1px}.mc-name{font-size:15px;font-weight:600;letter-spacing:.02em}.mc-sub{font-size:10.5px;color:var(--fg-dim);display:flex;gap:6px;align-items:center;min-width:0}.mc-sub span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mc-sub .sep{color:var(--muted-strong);flex:0 0 auto}.st-badge{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;padding:3px 8px;border:1px solid var(--accent);border-radius:2px;letter-spacing:.06em;color:var(--accent);background:rgba(133,153,0,.07)}.st-dot{width:6px;height:6px;border-radius:50%;display:inline-block;background:var(--accent);box-shadow:0 0 8px var(--accent)}.mc-idle .st-dot,.mc-offline .st-dot{box-shadow:none}.mc-uptime{font-size:10.5px;color:var(--dim);font-variant-numeric:tabular-nums;letter-spacing:.04em}.mc-agg{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;padding:6px 8px;background:var(--card-2);border:1px solid var(--border-soft);border-radius:3px}.mc-agg-l{display:flex;align-items:baseline;gap:6px}.mc-agg-r{font-size:10.5px;color:var(--fg-dim);font-variant-numeric:tabular-nums}.agg-k{font-size:9.5px;letter-spacing:.14em;color:var(--dim)}.agg-v{font-size:14px;font-weight:600;color:var(--accent);font-variant-numeric:tabular-nums}.pct-s{font-size:10px;opacity:.7;margin-left:1px}.ubar-wrap{position:relative;width:100%;min-width:40px;height:3px}.ubar-track{position:absolute;inset:0;background:rgba(7,54,66,.10);border-radius:1px}.ubar-fill{position:absolute;left:0;top:0;height:3px;border-radius:1px;background:var(--accent);box-shadow:0 0 8px var(--accent);transition:width 1.2s cubic-bezier(.4,0,.2,1)}.gpu-row{display:flex;flex-direction:column;gap:7px}.gpu-row-head{display:flex;align-items:center;gap:10px;font-size:11px}.gpu-tag{padding:1px 5px;background:rgba(7,54,66,.08);color:var(--fg-dim);border-radius:2px;font-size:9.5px;letter-spacing:.08em;font-weight:600}.gpu-model{color:var(--fg-dim);flex:1;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gpu-util-pct{font-size:14px;font-weight:600;color:var(--accent);font-variant-numeric:tabular-nums}.gpu-row-meta{display:grid;grid-template-columns:1.1fr 1.4fr;gap:8px}.meta-cell{display:flex;align-items:center;gap:5px;font-size:10.5px;min-width:0}.meta-k{color:var(--dim);font-size:9px;letter-spacing:.1em;font-weight:600}.meta-v{color:var(--fg);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.meta-mini-bar{flex:1;min-width:18px;height:3px;background:rgba(7,54,66,.10);border-radius:1px;overflow:hidden}.meta-mini-bar>span{display:block;height:100%;background:var(--accent)}.mc-task{padding:8px 10px;background:var(--card-2);border:1px solid var(--border-soft);border-left:2px solid var(--accent);border-radius:2px;display:flex;flex-direction:column;gap:3px}.task-row{display:flex;align-items:center;gap:6px;min-width:0}.task-arrow{color:var(--accent)}.task-name{font-size:12px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.task-meta,.task-purpose{font-size:10.5px;color:var(--fg-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mc-term{margin:0 -14px;background:var(--term-bg);border-top:1px solid var(--border)}.term-bar{display:flex;align-items:center;gap:8px;padding:5px 14px;font-size:10px;color:var(--dim);border-bottom:1px solid #073642;letter-spacing:.04em}.term-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 6px var(--accent);animation:blink 2s ease-in-out infinite}.mc-idle .term-dot,.mc-offline .term-dot{box-shadow:none;animation:none}@keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}.term-bar-t{flex:1;color:var(--term-fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.term-bar-eta{color:var(--dim)}.term-body{margin:0;padding:10px 14px 12px;font-size:10.5px;line-height:1.55;color:var(--term-fg);height:260px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;scrollbar-width:thin;scrollbar-color:#073642 transparent}.term-body::-webkit-scrollbar{width:8px}.term-body::-webkit-scrollbar-thumb{background:#073642;border-radius:4px}.run-panel{padding:0 22px 72px}.sec-t{display:flex;align-items:center;gap:10px;font-size:10.5px;letter-spacing:.14em;color:var(--dim);font-weight:600;margin:2px 0 12px}.sec-t-line{flex:1;height:1px;background:var(--border)}.run-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}.run-chip{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:10px 12px;min-width:0}.run-chip-h{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:var(--fg)}.run-chip-h span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.run-chip-m,.run-chip-f,.run-chip-note{font-size:10.5px;color:var(--fg-dim);margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.run-chip-f{color:var(--dim)}.empty{border:1px dashed var(--border);color:var(--dim);padding:16px;font-size:12px;text-align:center}.ticker{position:fixed;left:0;right:0;bottom:0;z-index:25;height:28px;display:flex;align-items:center;background:rgba(253,246,227,.92);backdrop-filter:blur(8px);border-top:1px solid var(--border);font-size:10.5px;overflow:hidden}.ticker-tag{padding:4px 10px;background:var(--ok);color:var(--bg);font-weight:700;letter-spacing:.12em;margin-right:12px;height:100%;display:flex;align-items:center}.ticker-row{display:flex;gap:28px;white-space:nowrap;color:var(--fg-dim)}@media (max-width:900px){.topbar{grid-template-columns:1fr;grid-template-areas:"l" "c" "r" "f"}.topbar-c,.topbar-r{justify-content:flex-start}.grid{grid-template-columns:1fr;padding:14px 14px 28px}.filters{overflow:auto}.term-body{height:220px}}@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 EOF
+  cat <<'EOF'
+.grid-empty{margin:18px 22px 26px;border:1px dashed var(--border);border-radius:4px;background:rgba(255,251,239,.65);color:var(--fg-dim);padding:18px 20px;font-size:12px;letter-spacing:.04em}.grid-empty[hidden]{display:none}.flt[disabled]{opacity:.45;cursor:not-allowed}.live-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok);margin-right:6px;vertical-align:middle}.stale .live-dot{background:var(--warm);box-shadow:none}.stale #ticker-generated{color:var(--warm)}
+EOF
 }
 
 dashboard_js() {
@@ -1828,9 +1984,17 @@ dashboard_js() {
     currentFilter = filter || "all";
     sessionStorage.setItem(pageKey + ":filter", currentFilter);
     document.querySelectorAll("[data-filter]").forEach((b) => b.classList.toggle("on", b.dataset.filter === currentFilter));
+    let visibleCount = 0;
     document.querySelectorAll(".mc").forEach((card) => {
-      card.hidden = currentFilter !== "all" && card.dataset.status !== currentFilter;
+      const visible = currentFilter === "all" || card.dataset.status === currentFilter;
+      card.hidden = !visible;
+      if (visible) visibleCount += 1;
     });
+    const empty = document.getElementById("grid-empty");
+    if (empty) {
+      empty.hidden = visibleCount !== 0;
+      empty.textContent = currentFilter === "all" ? "没有设备。" : `没有匹配 ${currentFilter} 的设备。`;
+    }
   }
   function applyState(state){
     if (!state) return;
@@ -1850,7 +2014,7 @@ dashboard_js() {
     setHtml("heatmap", state.heatCellsHtml);
     setHtml("device-grid", state.cardsHtml);
     setHtml("runs-root", state.runsHtml);
-    setText("ticker-generated", `generated ${state.generatedAt}`);
+    setText("ticker-generated", `generated ${state.generatedAt} · polling ${refreshSeconds || 3}s`);
     restoreTerms(previousTerms);
     applyFilter(currentFilter);
     window.scrollTo(0, previousY);
@@ -1873,7 +2037,7 @@ dashboard_js() {
   applyState(window.__AUTODL_DASHBOARD_STATE__);
   const saved = JSON.parse(sessionStorage.getItem(pageKey) || "{}");
   if (typeof saved.pageY === "number") window.scrollTo(0, saved.pageY);
-  if (refreshSeconds > 0) window.setInterval(loadState, refreshSeconds * 1000);
+  window.setInterval(loadState, (refreshSeconds || 3) * 1000);
 })();
 EOF
 }
@@ -1955,8 +2119,8 @@ render_dashboard() {
       printf '<button class="seg-btn on">manual</button>'
     fi
     printf '</div></div></div><div class="filters"><button class="flt on" data-filter="all"><span>全部</span><span id="count-all" class="flt-c">0</span></button><button class="flt" data-filter="training"><span>训练中</span><span id="count-training" class="flt-c">0</span></button><button class="flt" data-filter="idle"><span>空闲</span><span id="count-idle" class="flt-c">0</span></button><button class="flt" data-filter="error"><span>异常</span><span id="count-error" class="flt-c">0</span></button><button class="flt" data-filter="offline"><span>离线</span><span id="count-offline" class="flt-c">0</span></button></div></header>'
-    printf '<main id="device-grid" class="grid"></main><div id="runs-root"></div>'
-    printf '<div class="ticker"><span class="ticker-tag">EVT</span><div class="ticker-row"><span id="ticker-generated">generated %s</span><span>read-only dashboard</span><span>state updates without full page reload</span></div></div>' "$(html_escape "$generated_at")"
+    printf '<main id="device-grid" class="grid"></main><div id="grid-empty" class="grid-empty" hidden></div><div id="runs-root"></div>'
+    printf '<div class="ticker"><span class="ticker-tag">EVT</span><div class="ticker-row"><span id="ticker-generated"><span class="live-dot"></span>generated %s</span><span>read-only dashboard</span><span>state updates without full page reload</span></div></div>' "$(html_escape "$generated_at")"
     printf '<script>window.__AUTODL_REFRESH_SECONDS__=%s;window.__AUTODL_STATE_SRC__=%s;</script>' "${refresh_seconds:-0}" "$(js_string "$state_src")"
     printf '<script src="%s"></script><script>' "$(html_escape "$state_src")"
     dashboard_js
@@ -2005,6 +2169,129 @@ cmd_dashboard() {
   if [ "$open_file" = "true" ]; then
     command -v open >/dev/null 2>&1 && open "$output" || info "open command not available."
   fi
+}
+
+cmd_tmux_check() {
+  load_project
+  local account_override="" remote_override="" socket output rc
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account) account_override="$2"; shift 2 ;;
+      --remote) remote_override="$2"; shift 2 ;;
+      *) die "unknown tmux check option: $1" ;;
+    esac
+  done
+  apply_context_override "$account_override" "$remote_override"
+  socket="$(tmux_socket_path)"
+  output="$(ssh_capture "if command -v tmux >/dev/null 2>&1; then printf 'tmux=present\npath='; command -v tmux; tmux -V; printf 'socket=%s\n' $(shell_quote "$socket"); else printf 'tmux=missing\n'; printf '%s\n' $(shell_quote "$(tmux_missing_text)"); exit 127; fi" 2>&1)"
+  rc=$?
+  printf '%s\n' "$output"
+  return "$rc"
+}
+
+cmd_tmux_install() {
+  load_project
+  local account_override="" remote_override=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account) account_override="$2"; shift 2 ;;
+      --remote) remote_override="$2"; shift 2 ;;
+      *) die "unknown tmux install option: $1" ;;
+    esac
+  done
+  apply_context_override "$account_override" "$remote_override"
+  ssh_run "set -e; if command -v tmux >/dev/null 2>&1; then echo 'tmux=present'; tmux -V; exit 0; fi; if command -v apt-get >/dev/null 2>&1; then echo 'package_manager=apt-get'; export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y tmux; elif command -v yum >/dev/null 2>&1; then echo 'package_manager=yum'; yum install -y tmux; elif command -v dnf >/dev/null 2>&1; then echo 'package_manager=dnf'; dnf install -y tmux; elif command -v apk >/dev/null 2>&1; then echo 'package_manager=apk'; apk add --no-cache tmux; else echo 'No supported package manager found. Please install tmux on the remote machine.' >&2; exit 127; fi; command -v tmux; tmux -V"
+}
+
+cmd_tmux_list() {
+  load_project
+  local account_override="" remote_override="" socket
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account) account_override="$2"; shift 2 ;;
+      --remote) remote_override="$2"; shift 2 ;;
+      *) die "unknown tmux list option: $1" ;;
+    esac
+  done
+  apply_context_override "$account_override" "$remote_override"
+  socket="$(tmux_socket_path)"
+  ssh_run "if ! command -v tmux >/dev/null 2>&1; then printf '%s\n' $(shell_quote "$(tmux_missing_text)"); exit 127; fi; if [ -S $(shell_quote "$socket") ]; then tmux -S $(shell_quote "$socket") list-sessions -F '#{session_name} #{session_windows} windows created=#{session_created_string} attached=#{session_attached}'; else echo 'No AutoDL Remote tmux sessions.'; fi"
+}
+
+cmd_tmux_capture() {
+  load_project
+  local account_override="" remote_override="" lines=120 session="" socket
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account) account_override="$2"; shift 2 ;;
+      --remote) remote_override="$2"; shift 2 ;;
+      --lines) lines="$2"; shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  case "$lines" in
+    ""|*[!0-9]*) die "--lines must be a non-negative integer" ;;
+  esac
+  [ $# -gt 0 ] || die "tmux capture requires a session name"
+  session="$(sanitize_name "$1")"
+  apply_context_override "$account_override" "$remote_override"
+  socket="$(tmux_socket_path)"
+  remote_tmux_capture "$session" "$socket" "$lines"
+}
+
+cmd_tmux_attach_cmd() {
+  load_project
+  local account_override="" remote_override="" session="" socket cmd
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account) account_override="$2"; shift 2 ;;
+      --remote) remote_override="$2"; shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "tmux attach-cmd requires a session name"
+  session="$(sanitize_name "$1")"
+  apply_context_override "$account_override" "$remote_override"
+  socket="$(tmux_socket_path)"
+  cmd="ssh -p $(shell_quote "$ACCOUNT_PORT")"
+  [ -z "$ACCOUNT_KEY" ] || cmd="$cmd -i $(shell_quote "$ACCOUNT_KEY")"
+  cmd="$cmd -t $(shell_quote "$ACCOUNT_TARGET") $(shell_quote "tmux -S $(shell_quote "$socket") attach -t $(shell_quote "$session")")"
+  printf '%s\n' "$cmd"
+}
+
+cmd_tmux_kill() {
+  load_project
+  local account_override="" remote_override="" session="" socket
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account) account_override="$2"; shift 2 ;;
+      --remote) remote_override="$2"; shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "tmux kill requires a session name"
+  session="$(sanitize_name "$1")"
+  apply_context_override "$account_override" "$remote_override"
+  socket="$(tmux_socket_path)"
+  ssh_run "if ! command -v tmux >/dev/null 2>&1; then printf '%s\n' $(shell_quote "$(tmux_missing_text)"); exit 127; fi; tmux -S $(shell_quote "$socket") kill-session -t $(shell_quote "$session")"
+}
+
+cmd_tmux() {
+  [ $# -gt 0 ] || die "tmux requires a subcommand"
+  local sub="$1"
+  shift
+  case "$sub" in
+    check) cmd_tmux_check "$@" ;;
+    install) cmd_tmux_install "$@" ;;
+    list|ls) cmd_tmux_list "$@" ;;
+    capture) cmd_tmux_capture "$@" ;;
+    attach-cmd) cmd_tmux_attach_cmd "$@" ;;
+    kill) cmd_tmux_kill "$@" ;;
+    *) die "unknown tmux command: $sub" ;;
+  esac
 }
 
 cmd_shutdown() {
@@ -2108,6 +2395,7 @@ main() {
     model-dir) cmd_model_dir "$@" ;;
     fleet) cmd_fleet "$@" ;;
     dashboard) cmd_dashboard "$@" ;;
+    tmux) cmd_tmux "$@" ;;
     exec) cmd_exec "$@" ;;
     put-run) cmd_put_run "$@" ;;
     put|sync-up) cmd_put "$@" ;;
